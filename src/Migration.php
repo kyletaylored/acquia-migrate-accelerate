@@ -21,6 +21,34 @@ use Drupal\migrate\Plugin\MigrationInterface;
 final class Migration {
 
   /**
+   * Nothing is happening for this migration.
+   *
+   * @var string
+   */
+  const ACTIVITY_IDLE = 'idle';
+
+  /**
+   * This migration is being imported.
+   *
+   * @var string
+   */
+  const ACTIVITY_IMPORTING = 'importing';
+
+  /**
+   * This migration is being rolled back.
+   *
+   * @var string
+   */
+  const ACTIVITY_ROLLING_BACK = 'rollingBack';
+
+  /**
+   * This migration is being refreshed.
+   *
+   * @var string
+   */
+  const ACTIVITY_REFRESHING = 'refreshing';
+
+  /**
    * The migration ID: an opaque identifier, without meaning.
    *
    * @var string
@@ -77,6 +105,20 @@ final class Migration {
   protected $skipped;
 
   /**
+   * The source data fingerprint taken when the migration was last imported.
+   *
+   * @var string
+   */
+  protected $lastImportFingerprint;
+
+  /**
+   * The source data fingerprint that was most recently computed.
+   *
+   * @var string
+   */
+  protected $lastComputedFingerprint;
+
+  /**
    * The UNIX timestamp when the last import started, if any.
    *
    * @var int|null
@@ -111,12 +153,16 @@ final class Migration {
    *   Whether this migration is marked as completed.
    * @param bool $skipped
    *   Whether this migration is marked as skipped.
+   * @param string $last_import_fingerprint
+   *   The data fingerprint taken when the migration was last imported.
+   * @param string $last_computed_fingerprint
+   *   The data fingerprint that was most recently computed.
    * @param int|null $last_import_timestamp
    *   The UNIX timestamp when the last import started, if any.
    * @param int|null $last_import_duration
    *   The duration in seconds of the last import, if any.
    */
-  public function __construct(string $id, string $label, array $dependencies, array $migration_plugins, array $data_migration_plugin_ids, bool $completed, bool $skipped, ?int $last_import_timestamp, ?int $last_import_duration) {
+  public function __construct(string $id, string $label, array $dependencies, array $migration_plugins, array $data_migration_plugin_ids, bool $completed, bool $skipped, string $last_import_fingerprint, string $last_computed_fingerprint, ?int $last_import_timestamp, ?int $last_import_duration) {
     $this->id = $id;
     $this->label = $label;
     assert(Inspector::assertAllStrings(array_keys($dependencies)));
@@ -124,10 +170,12 @@ final class Migration {
     assert(Inspector::assertAllObjects($migration_plugins, MigrationPlugin::class));
     $this->migrationPlugins = $migration_plugins;
     assert(Inspector::assertAllStrings($data_migration_plugin_ids));
-    assert(array_diff(array_keys(array_splice($migration_plugins, count($migration_plugins) - count($data_migration_plugin_ids))), $data_migration_plugin_ids) === [], 'The data migration plugin are executed last.');
+    assert(array_diff(array_keys(array_splice($migration_plugins, count($migration_plugins) - count($data_migration_plugin_ids))), $data_migration_plugin_ids) === [], 'The data migration plugin are executed last for migration ' . $id . ' — (all migration plugins: ' . implode(', ', array_keys($migration_plugins)) . ', data migration plugins: ' . implode(', ', $data_migration_plugin_ids) . '.');
     $this->dataMigrationPluginIds = $data_migration_plugin_ids;
     $this->completed = $completed;
     $this->skipped = $skipped;
+    $this->lastImportFingerprint = $last_import_fingerprint;
+    $this->lastComputedFingerprint = $last_computed_fingerprint;
     $this->lastImportTimestamp = $last_import_timestamp;
     $this->lastImportDuration = $last_import_duration;
   }
@@ -189,6 +237,8 @@ final class Migration {
     $flags = $all_flags[$this->id];
     $this->completed = $flags->completed;
     $this->skipped = $flags->skipped;
+    $this->lastImportFingerprint = $flags->last_import_fingerprint;
+    $this->lastComputedFingerprint = $flags->last_computed_fingerprint;
     $this->lastImportTimestamp = $flags->last_import_timestamp;
     $this->lastImportDuration = $flags->last_import_duration;
   }
@@ -262,7 +312,7 @@ final class Migration {
   /**
    * Gets the the migration plugins that this migration consists of.
    *
-   * @return string[]
+   * @return \Drupal\migrate\Plugin\Migration[]
    *   A list of migration plugin instances.
    */
   public function getMigrationPluginInstances() : array {
@@ -416,6 +466,16 @@ final class Migration {
   }
 
   /**
+   * Whether this migration's imported data is stale.
+   *
+   * @return bool
+   *   Whether this migration is stale.
+   */
+  public function isStale() : bool {
+    return MigrationFingerprinter::detectChange($this->lastImportFingerprint, $this->lastComputedFingerprint) && $this->canBeRolledBack();
+  }
+
+  /**
    * The UNIX timestamp when the last import started, if any.
    *
    * @return int|null
@@ -442,6 +502,11 @@ final class Migration {
    *   An array of link URLs.
    */
   protected function getAvailableLinkUrls() : array {
+    // If this migration is not idle, do not allow any other activities.
+    if ($this->getActivity() !== self::ACTIVITY_IDLE) {
+      return [];
+    }
+
     $urls = [];
 
     $update_resource_url = Url::fromRoute('acquia_migrate.api.migration.patch')
@@ -464,21 +529,20 @@ final class Migration {
         'migrationId' => $this->id(),
       ]);
     }
-    if ($this->getProcessedCount() > 0) {
-      $rollback_capable_plugins = array_reduce($this->migrationPlugins, function (array $rollback_capable_plugins, MigrationInterface $migration_plugin) {
-        return $migration_plugin->getDestinationPlugin()->supportsRollback()
-          ? array_merge($rollback_capable_plugins, [$migration_plugin])
-          : $rollback_capable_plugins;
-      }, []);
-      // @todo: should there be a special case here when *some*, but not *all*, plugins support rollback?
-      if (count($rollback_capable_plugins) > 0 && count($rollback_capable_plugins) === count($this->migrationPlugins)) {
-        $urls['rollback'] = Url::fromRoute('acquia_migrate.api.migration.rollback')->setOption('query', [
-          'migrationId' => $this->id(),
-        ]);
-        $urls['rollback-and-import'] = Url::fromRoute('acquia_migrate.api.migration.rollback_import')->setOption('query', [
-          'migrationId' => $this->id(),
-        ]);
-      }
+
+    if ($this->canBeRolledBack()) {
+      $urls['rollback'] = Url::fromRoute('acquia_migrate.api.migration.rollback')->setOption('query', [
+        'migrationId' => $this->id(),
+      ]);
+      $urls['rollback-and-import'] = Url::fromRoute('acquia_migrate.api.migration.rollback_import')->setOption('query', [
+        'migrationId' => $this->id(),
+      ]);
+    }
+
+    if ($this->isStale() && $this->isImportable()) {
+      $urls['refresh'] = Url::fromRoute('acquia_migrate.api.migration.refresh')->setOption('query', [
+        'migrationId' => $this->id(),
+      ]);
     }
 
     if (!$this->isCompleted()) {
@@ -522,6 +586,26 @@ final class Migration {
     }
 
     return $urls;
+  }
+
+  /**
+   * Whether this migration is capable of being rolled back.
+   *
+   * @return bool
+   *   TRUE if a migration has processed at least 1 row and all of its migration
+   *   plugins can be rolled back, FALSE otherwise.
+   */
+  protected function canBeRolledBack() : bool {
+    if ($this->getProcessedCount() === 0) {
+      return FALSE;
+    }
+    // @todo: should there be a special case here when *some*, but not *all*, plugins support rollback?
+    $rollback_capable_plugins = array_reduce($this->migrationPlugins, function (array $rollback_capable_plugins, MigrationInterface $migration_plugin) {
+      return $migration_plugin->getDestinationPlugin()->supportsRollback()
+        ? array_merge($rollback_capable_plugins, [$migration_plugin])
+        : $rollback_capable_plugins;
+    }, []);
+    return count($rollback_capable_plugins) > 0 && count($rollback_capable_plugins) === count($this->migrationPlugins);
   }
 
   /**
@@ -595,6 +679,47 @@ final class Migration {
   }
 
   /**
+   * Gets the current activity of the migration.
+   *
+   * @return string
+   *   Either:
+   *   - Migration::ACTIVITY_IDLE
+   *   - Migration::ACTIVITY_IMPORTING
+   *   - Migration::ACTIVITY_ROLLING_BACK
+   */
+  public function getActivity() : string {
+    $max_migration_plugin_status = array_reduce($this->dataMigrationPluginIds, function (int $max, string $id) {
+      $max = max($max, $this->migrationPlugins[$id]->getStatus());
+      return $max;
+    }, MigrationInterface::STATUS_IDLE);
+
+    switch ($max_migration_plugin_status) {
+      case MigrationInterface::STATUS_IMPORTING:
+        // Refreshing is a special case of importing as far as the migration
+        // system is concerned. Therefore we need to carefully detect this. Note
+        // this is specifically not using ::getUiProcecessedCount()!
+        // @see ::getProcessedCount()
+        // @see ::getUiProcessedCount()
+        if ($this->getProcessedCount() == $this->getTotalCount()) {
+          return self::ACTIVITY_REFRESHING;
+        }
+        return self::ACTIVITY_IMPORTING;
+
+      case MigrationInterface::STATUS_ROLLING_BACK:
+        return self::ACTIVITY_ROLLING_BACK;
+
+      default:
+        // Note that MigrationInterface::STATUS_STOPPING is irrelevant to us,
+        // since it is used by MigrateUpgradeImportBatch to signal the end of
+        // the processing within a single batch request.
+        // Note that MigrationInterface::STATUS_DISABLED is irrelevant to us,
+        // since we do not use this functionality and it does not actually
+        // reflect an activity.
+        return self::ACTIVITY_IDLE;
+    }
+  }
+
+  /**
    * Maps a Migration object to JSON:API resource object array.
    *
    * @param \Drupal\acquia_migrate\Migration $migration
@@ -648,8 +773,10 @@ final class Migration {
         'processedCount' => $migration->getUiProcessedCount(),
         'totalCount' => $migration->getTotalCount(),
         'completed' => $migration->isCompleted(),
+        'stale' => $migration->isStale(),
         'skipped' => $migration->isSkipped(),
         'lastImported' => NULL,
+        'activity' => $migration->getActivity(),
       ],
       'relationships' => [
         'dependencies' => [
@@ -741,6 +868,11 @@ final class Migration {
         case 'rollback-and-import':
           $link_rel = UriDefinitions::LINK_REL_START_BATCH_PROCESS;
           $link_title = t('Rollback and import');
+          break;
+
+        case 'refresh':
+          $link_rel = UriDefinitions::LINK_REL_START_BATCH_PROCESS;
+          $link_title = t('Refresh');
           break;
 
         case 'complete':

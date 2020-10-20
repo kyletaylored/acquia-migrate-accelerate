@@ -5,6 +5,7 @@ namespace Drupal\acquia_migrate;
 use Drupal\Component\Assertion\Inspector;
 use Drupal\Core\Entity\EntityTypeManagerInterface;
 use Drupal\Core\Extension\ModuleHandlerInterface;
+use Drupal\Core\Plugin\PluginBase;
 use Drupal\Core\StringTranslation\StringTranslationTrait;
 use Drupal\migrate\Exception\RequirementsException;
 use Drupal\migrate\MigrateBuildDependencyInterface;
@@ -24,6 +25,28 @@ class MigrationClusterer {
   const CLUSTER_SITE_CONFIGURATION_NEEDS_HUMAN = 'Site configuration — NEEDS HUMAN';
   const CLUSTER_DATA_MODEL = 'Data model';
   const CLUSTER_NONE = 'None';
+
+  /**
+   * Base plugin IDs of paragraph entity migrations.
+   *
+   * @var string[]
+   */
+  const PARAGRAPHS_MIGRATION_BASE_PLUGIN_IDS = [
+    'd7_paragraphs',
+    'd7_paragraphs_revisions',
+    'd7_field_collection',
+    'd7_field_collection_revisions',
+  ];
+
+  /**
+   * IDs of the legacy entity types migrated to paragraph entities.
+   *
+   * @var string[]
+   */
+  const PARAGRAPHS_LEGACY_ENTITY_TYPE_IDS = [
+    'paragraphs_item',
+    'field_collection_item',
+  ];
 
   /**
    * Clusters of the simple type can be run independently.
@@ -296,13 +319,22 @@ class MigrationClusterer {
         $dest_entity_type_id = $this->getDestinationEntityTypeId($migration);
         // Paragraph or field collection field config migrations have
         // 'paragraphs_item', 'field_collection_item' source entity type.
-        if (in_array($field_entity_type_id, ['paragraphs_item', 'field_collection_item'], TRUE) || $dest_entity_type_id === 'paragraphs_type') {
-          // The only issue with paragraphs shared structure cluster is that
-          // it seems that type (bundle) and field storage imports aren't run
-          // before the field instance config imports that results in skipped
-          // rows for the field widget settings of the nested field collection.
-          $entity_type = $this->entityTypeManager->getDefinition('paragraph', FALSE);
-          $label = $entity_type ? $entity_type->getPluralLabel() : 'paragraphs';
+        // Rather than automatically generating a label for the Paragraphs &
+        // Field Collection migrations, create these manually to ensure they
+        // each get their own shared structure migration. (Otherwise there would
+        // only be one, since both end up getting migrated into Paragraphs in
+        // Drupal 9.)
+        if (
+          $field_entity_type_id === 'field_collection_item' ||
+          $source_config['plugin'] === 'd7_field_collection_type'
+        ) {
+          $label = 'field collection items';
+        }
+        elseif (
+          $field_entity_type_id === 'paragraphs_item' ||
+          $source_config['plugin'] === 'd7_paragraphs_type'
+        ) {
+          $label = 'paragraphs';
         }
         // Media entities in Drupal 7 are (fieldable) file entities, so the
         // view mode and the field storage migration's source entity type ID
@@ -331,16 +363,40 @@ class MigrationClusterer {
     // Append the entity shared structure migration clusters to the result.
     $clustered_migrations = $clustered_migrations + $shared_structure_migrations;
 
+    $shared_data_migrations = array_map(
+      function (Migration $migration) {
+        $source_parent_type = $migration->getSourceConfiguration()['parent_type'] ?? 'unknown';
+        $dest_entity_type_id = $this->getDestinationEntityTypeId($migration) ?? 'unknown';
+
+        switch ("$dest_entity_type_id::$source_parent_type") {
+          case 'paragraph::field_collection_item':
+            $entity_type_plural_label = $this->t('nested field collection items');
+            break;
+
+          case 'paragraph::paragraphs_item':
+            $entity_type_plural_label = $this->t('nested paragraphs');
+            break;
+
+          default:
+            $entity_type = $this->entityTypeManager->getDefinition($dest_entity_type_id, FALSE);
+            $entity_type_plural_label = $entity_type ? $entity_type->getPluralLabel() : $dest_entity_type_id;
+        }
+
+        $migration->setMetadata('cluster', (string) $this->t('Shared data for @entity-type-plural-label', [
+          '@entity-type-plural-label' => $entity_type_plural_label,
+        ]));
+
+        return $migration;
+      },
+      array_filter($migrations, [get_class($this), 'isSharedDataMigration'])
+    );
+
+    // Append the entity shared data migration clusters to the result.
+    $clustered_migrations = $clustered_migrations + $shared_data_migrations;
+
     // Compute cluster 3: one cluster per entity type + bundle.
     $entity_migrations = array_filter($migrations, [get_class($this), 'isContentEntityDestination']);
-    // Sort entity migrations by inspecting dependencies. Do this on a clone of
-    // each Migration object, to avoid overwriting the complete dependency
-    // metadata.
-    $entity_migrations = array_map(function ($object) {
-      return clone $object;
-    }, $entity_migrations);
-    $all_entity_migrations_sorted = array_keys($this->migrationManager->buildDependencyMigration($entity_migrations, []));
-    reset($all_entity_migrations_sorted);
+    $all_entity_migrations_sorted = $this->getSortedSubset(array_keys($entity_migrations), $migrations);
     // $entity_migrations contains only content entity migrations, not their
     // dependencies. Without their dependencies, they will fail. Use the
     // dependency metadata on the entity migrations to determine which other
@@ -352,15 +408,7 @@ class MigrationClusterer {
       $migration = $migrations[$migration_id];
       $entity_cluster = (string) $migration->label();
       if (!empty($migration->getMetadata('after'))) {
-        $to_be_lifted_migration_ids = array_diff_key(static::getRecursivelyRequiredMigrationDependencies($migration_id, $migrations), $entity_migrations_plus_dependencies, $clustered_migrations);
-        // "d7_menu_link:<entity_type_id>" migrations should be lifted into the
-        // corresponding entity cluster, and not into "d7_shortcut".
-        if ($migration_id === 'd7_shortcut') {
-          $to_be_lifted_migration_ids = array_filter($to_be_lifted_migration_ids, function (string $id) {
-            $base_plugin_id = explode(':', $id)[0];
-            return $base_plugin_id !== 'd7_menu_links';
-          });
-        }
+        $to_be_lifted_migration_ids = static::getRecursivelyRequiredMigrationDependenciesExcept($migration_id, $migrations, $entity_migrations_plus_dependencies, $clustered_migrations);
         $lifted_migrations = array_map(
           call_user_func_array([get_class($this), 'setClusterCallback'], ["LIFTED-$entity_cluster"]),
           array_intersect_key($migrations, $to_be_lifted_migration_ids)
@@ -392,6 +440,22 @@ class MigrationClusterer {
       // 4. non-dependee (no migrations depend on it: empty 'before' metadata)
       $is_non_dependee = empty($migration->getMetadata('before'));
       if ($is_cluster_depender && $is_non_dependee) {
+        // When there are multiple clustered dependees, try picking one that is
+        // more stable (less dependent on the outcome of core's migration plugin
+        // graph-based sorting), by excluding the entity clusters.
+        $stable_clustered_dependees = array_diff($clustered_dependees, array_keys($entity_migrations));
+        if (!empty($stable_clustered_dependees) && count($stable_clustered_dependees) < count($clustered_dependees)) {
+          if (count($stable_clustered_dependees) >= 1) {
+            // @codingStandardsIgnoreStart
+            \Drupal::logger('acquia_migrate')->debug('The @migration-id migration has multiple clustered dependees (@dependees), but even the stable subset (@stable-dependees) contains multiple cluster choices to push towards. Consider adding more heuristics for clustering, to avoid unstable cluster assignment. The stability of the current heuristic can be evaluated by analyzing these debug messages and observing whether the parentheticals ever have different orders.', [
+              '@migration-id' => $migration->id(),
+              '@dependees' => implode(', ', $clustered_dependees),
+              '@stable-dependees' => implode(', ', $stable_clustered_dependees),
+            ]);
+            // @codingStandardsIgnoreEnd
+          }
+          $clustered_dependees = $stable_clustered_dependees;
+        }
         // Push up towards the clustered dependee that runs last, to ensure all
         // dependencies continue to have been met by the time it will run.
         $migration_to_push_towards = end($clustered_dependees);
@@ -502,12 +566,13 @@ class MigrationClusterer {
     //   2. "Site configuration",
     //   3. "<site configuration that needs human>"
     //   4. "Data model" (optional)
-    //   5. "<(content) entity type shared structure if not bundleable>"
-    //   6. "<(content) entity type + bundle>"
-    //   7. "<config entity types that have dependencies and are not associated with content entities>"
-    //   8. "None".
+    //   5. "<(content) entity type shared config structure if not bundleable>"
+    //   6. "<(content) entity type shared data structure if not bundleable>"
+    //   7. "<(content) entity type + bundle>"
+    //   8. "<config entity types that have dependencies and are not associated with content entities>"
+    //   9. "None".
     // @codingStandardsIgnoreEnd
-    assert(array_keys($clustered_migrations) == array_keys($no_data_migrations + $any_time_migrations + $config_needing_human_migrations + $shared_structure_migrations + $entity_migrations_plus_dependencies + $dependent_config_entity_migrations + $migrations));
+    assert(array_keys($clustered_migrations) == array_keys($no_data_migrations + $any_time_migrations + $config_needing_human_migrations + $shared_structure_migrations + $shared_data_migrations + $entity_migrations_plus_dependencies + $dependent_config_entity_migrations + $migrations));
 
     return $clustered_migrations;
   }
@@ -525,7 +590,7 @@ class MigrationClusterer {
    * @return array
    *   An array of migration plugin IDs.
    */
-  protected static function getRecursivelyRequiredMigrationDependencies($migration_plugin_id, array $all_migration_plugins) : array {
+  protected static function getRecursivelyRequiredMigrationDependencies(string $migration_plugin_id, array $all_migration_plugins) : array {
     static $recursive_calls;
     if (!isset($recursive_calls)) {
       $recursive_calls = [];
@@ -541,34 +606,8 @@ class MigrationClusterer {
 
     $required = $all_migration_plugins[$migration_plugin_id]->getMigrationDependencies()['required'];
 
-    // Base plugin IDs with potential self- or circular dependency.
-    $known_faulty_base_plugin_ids = [
-      'd7_paragraphs',
-      'd7_field_collection',
-      'd7_paragraphs_revisions',
-      'd7_field_collection_revisions',
-    ];
-    $current_is_known_faulty_migration = in_array(explode(':', $migration_plugin_id)[0], $known_faulty_base_plugin_ids);
-
-    // Temporary fix for nested paragraph and nested field collection entity
-    // migrations. A derived nested paragraph entity (revision) migration
-    // depends on itself. To prevent infinitely searching for nested
-    // dependencies here, we remove the current migration plugin ID from the
-    // list of the first-level required migration plugins "$required".
-    // @todo Remove when https://backlog.acquia.com/browse/OCTO-3384 is solved.
-    // @see https://drupal.org/node/3145755#comment-13684540
-    if ($current_is_known_faulty_migration && isset($recursive_calls[$migration_plugin_id]) && in_array($migration_plugin_id, $required)) {
-      $key = array_search($migration_plugin_id, $required);
-      if ($key !== FALSE) {
-        unset($required[$key]);
-      }
-    }
-
     if (!array_key_exists($migration_plugin_id, $recursive_calls)) {
-      $recursive_calls[$migration_plugin_id] = 1;
-    }
-    elseif ($recursive_calls[$migration_plugin_id] < 2) {
-      $recursive_calls[$migration_plugin_id]++;
+      $recursive_calls[$migration_plugin_id] = $migration_plugin_id;
     }
     else {
       throw new \LogicException("Recursive limit reached in MigrationClusterer::getRecursivelyRequiredMigrationDependencies() for the migration with '$migration_plugin_id' plugin ID.");
@@ -581,6 +620,76 @@ class MigrationClusterer {
     }
     unset($recursive_calls[$migration_plugin_id]);
     return array_unique($deps);
+  }
+
+  /**
+   * Gets the recursive required dependencies for a migration plugin.
+   *
+   * @param string $migration_plugin_id
+   *   The ID of the migration plugin for which to get the recursive required
+   *   dependencies.
+   * @param \Drupal\migrate\Plugin\MigrationInterface[] $all_migration_plugins
+   *   An array of all available migration plugin instances, keyed by migration
+   *   ID.
+   * @param array $except
+   *   Arrays of migration plugin IDs to exclude.
+   *
+   * @return array
+   *   An array of migration plugin IDs.
+   */
+  protected static function getRecursivelyRequiredMigrationDependenciesExcept(string $migration_plugin_id, array $all_migration_plugins, array ...$except) : array {
+    return array_diff_key(static::getRecursivelyRequiredMigrationDependencies($migration_plugin_id, $all_migration_plugins), ...$except);
+  }
+
+  /**
+   * Gets a sorted subset of migration plugin IDs.
+   *
+   * @param string[] $subset
+   *   The subset of migration plugin IDs for which to get the required
+   *   dependency-respecting sorting order.
+   * @param \Drupal\migrate\Plugin\MigrationInterface[] $all_migration_plugins
+   *   An array of all available migration plugin instances, keyed by migration
+   *   ID.
+   *
+   * @return string[]
+   *   The sorted subset of migration plugin IDs.
+   */
+  protected function getSortedSubset(array $subset, array $all_migration_plugins) : array {
+    // @codingStandardsIgnoreStart
+    // Assert shape of input data:
+    // - they must be Migration plugin instances
+    assert(Inspector::assertAllObjects($all_migration_plugins, Migration::class));
+    // - the subset must be valid
+    assert(count($subset) === count(array_intersect(array_keys($all_migration_plugins), $subset)));
+    // @codingStandardsIgnoreEnd
+
+    // Sort migrations by inspecting dependencies. Do this on a clone of each
+    // Migration plugin instance, to avoid overwriting the complete dependency
+    // metadata. To ensure a correct ordering, we must include all required
+    // dependencies in this subset too: we must operate on the subgraph.
+    $subgraph = [];
+    foreach ($subset as $migration_plugin_id) {
+      $subgraph[$migration_plugin_id] = clone $all_migration_plugins[$migration_plugin_id];
+      // Add missing required dependencies to the subgraph.
+      $missing_dependencies = static::getRecursivelyRequiredMigrationDependenciesExcept($migration_plugin_id, $all_migration_plugins, $subgraph);
+      foreach ($missing_dependencies as $dependency_plugin_id) {
+        // Some required migration dependencies may not exist because they were
+        // explicitly omitted by the migration plugin manager due to their
+        // requirements not having been met.
+        // For example, d7_user depends on user_profile_field_instance, but not
+        // every D7 site has user profile fields enabled.
+        if (isset($all_migration_plugins[$dependency_plugin_id])) {
+          $subgraph[$dependency_plugin_id] = clone $all_migration_plugins[$dependency_plugin_id];
+        }
+      }
+    }
+    $sorted_subgraph = $this->migrationManager->buildDependencyMigration($subgraph, []);
+    $sorted_subset = array_intersect(array_keys($sorted_subgraph), $subset);
+    reset($sorted_subset);
+
+    assert(count($subset) === count(array_intersect($subset, $sorted_subset)));
+
+    return $sorted_subset;
   }
 
   /**
@@ -696,22 +805,57 @@ class MigrationClusterer {
   }
 
   /**
+   * Checks whether this migration represents a "shared data" migration.
+   *
+   * @param \Drupal\migrate\Plugin\Migration $migration
+   *   The migration plugin instance to check.
+   *
+   * @return bool
+   *   TRUE when the migration represents a "shared data" migration.
+   */
+  protected function isSharedDataMigration(Migration $migration) {
+    $dest_entity_type_id = $this->getDestinationEntityTypeId($migration);
+
+    // Nested paragraph migrations.
+    if ($dest_entity_type_id !== 'paragraph') {
+      return FALSE;
+    }
+
+    $plugin_id_parts = explode(PluginBase::DERIVATIVE_SEPARATOR, $migration->id());
+    if (count($plugin_id_parts) < 3) {
+      return FALSE;
+    }
+    [
+      $base_plugin_id,
+      $parent_entity_type_id,
+    ] = $plugin_id_parts;
+    if (
+      in_array($base_plugin_id, self::PARAGRAPHS_MIGRATION_BASE_PLUGIN_IDS, TRUE) &&
+      in_array($parent_entity_type_id, self::PARAGRAPHS_LEGACY_ENTITY_TYPE_IDS, TRUE)
+    ) {
+      return TRUE;
+    }
+
+    return FALSE;
+  }
+
+  /**
    * Sets the cluster label on a migration.
    *
    * @param string $label
    *   The cluster label to set.
-   * @param bool $overwrite_existing
+   * @param bool $overwrite_existing_label
    *   (optional) Whether existing cluster metadata should be overwritten.
    *   Defaults to FALSE.
    *
    * @return \Closure
    *   A function that sets the cluster on the passed migration plugin instance.
    */
-  protected static function setClusterCallback(string $label, bool $overwrite_existing = FALSE) : \Closure {
-    return function (Migration $migration) use ($label, $overwrite_existing) {
+  protected static function setClusterCallback(string $label, bool $overwrite_existing_label = FALSE) : \Closure {
+    return function (Migration $migration) use ($label, $overwrite_existing_label) {
       $existing_cluster = $migration->getMetadata('cluster');
       // Don't overwrite the assigned cluster.
-      if (empty($existing_cluster) || $overwrite_existing) {
+      if (empty($existing_cluster) || $overwrite_existing_label) {
         $migration->setMetadata('cluster', $label);
       }
       return $migration;

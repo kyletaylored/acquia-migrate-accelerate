@@ -14,7 +14,9 @@ services:
       - '@acquia_migrate.mapping_manipulator'
       - '@acquia_migrate.message_analyzer'
       - '@acquia_migrate.module_auditor'
+      - '@acquia_migrate.migration_fingerprinter'
       - '@config.factory'
+      - '@lock.persistent'
 
   # Migration action supporting services: preview, mapping viewer, mapping manipulator.
   acquia_migrate.previewer:
@@ -58,8 +60,18 @@ services:
     arguments:
       - '@extension.list.module'
       - '@module_handler'
+      - '@info_parser'
       - '@state'
       - '@string_translation'
+
+  # Fingerprints migration data to detect when a migration needs to be rerun.
+  acquia_migrate.migration_fingerprinter:
+    class: \Drupal\acquia_migrate\MigrationFingerprinter
+    arguments:
+      - '@acquia_migrate.migration_repository'
+      - '@database'
+      - '@state'
+      - '@file_system'
 
   # We decorate the plugin.manager.migration service because it's impossible to decorate through a ServiceProvider.
   # (ServiceProviders are invoked in alphabetical order by ModifyServiceDefinitionsPass, not by priority. Which means
@@ -140,6 +152,10 @@ services:
     class: Drupal\acquia_migrate\MigrationAlterer
     arguments:
       - '@entity_type.manager'
+      - '@entity_field.manager'
+      - '@plugin.manager.migrate.source'
+      - '@plugin.manager.migrate.destination'
+      - '@logger.channel.acquia_migrate'
 
   # Service decorator
   acquia_migrate.cache_tags.invalidator:

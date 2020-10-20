@@ -2,13 +2,23 @@
 
 namespace Drupal\acquia_migrate;
 
+use Drupal\Component\Plugin\Exception\PluginException;
 use Drupal\Component\Plugin\Exception\PluginNotFoundException;
 use Drupal\Component\Plugin\PluginBase;
 use Drupal\Core\Entity\ContentEntityTypeInterface;
+use Drupal\Core\Entity\EntityFieldManagerInterface;
 use Drupal\Core\Entity\EntityTypeManagerInterface;
+use Drupal\Core\Field\BaseFieldDefinition;
+use Drupal\Core\Logger\LoggerChannelInterface;
+use Drupal\Core\Logger\RfcLogLevel;
 use Drupal\Core\StringTranslation\StringTranslationTrait;
 use Drupal\Core\StringTranslation\TranslatableMarkup;
 use Drupal\migrate\Exception\RequirementsException;
+use Drupal\migrate\Plugin\migrate\destination\Entity;
+use Drupal\migrate\Plugin\migrate\destination\EntityContentBase;
+use Drupal\migrate\Plugin\MigratePluginManagerInterface;
+use Drupal\migrate\Plugin\MigrateSourceInterface;
+use Drupal\migrate\Plugin\Migration as MigrationPlugin;
 use Drupal\migrate\Plugin\MigrationDeriverTrait;
 use Drupal\migrate\Row;
 use Drupal\migrate_drupal\Plugin\migrate\source\DrupalSqlBase;
@@ -112,6 +122,22 @@ final class MigrationAlterer {
     ],
   ];
 
+  const FIELD_MIGRATION_PLUGIN_IDS = [
+    'd7_view_modes',
+    'd7_field',
+    'd7_field_instance',
+    'd7_field_instance_widget_settings',
+    'd7_field_formatter_settings',
+    'd7_field_instance_per_form_display',
+    'd7_field_instance_per_view_mode',
+  ];
+
+  const ENTITY_TYPE_KNOWN_REMAP = [
+    // @see \Drupal\paragraphs\MigrationPluginsAlterer::PARAGRAPHS_ENTITY_TYPE_ID_MAPs
+    'field_collection_item' => 'paragraph',
+    'paragraphs_item' => 'paragraph',
+  ];
+
   /**
    * Migration tag.
    *
@@ -130,13 +156,53 @@ final class MigrationAlterer {
   protected $entityTypeManager;
 
   /**
+   * The entity field manager.
+   *
+   * @var \Drupal\Core\Entity\EntityFieldManagerInterface
+   */
+  protected $entityFieldManager;
+
+  /**
+   * The migration source plugin manager.
+   *
+   * @var \Drupal\migrate\Plugin\MigrationPluginManagerInterface
+   */
+  protected $sourcePluginManager;
+
+  /**
+   * The migration destination plugin manager.
+   *
+   * @var \Drupal\migrate\Plugin\MigrationPluginManagerInterface
+   */
+  protected $destinationPluginManager;
+
+  /**
+   * The logger to use.
+   *
+   * @var \Drupal\Core\Logger\LoggerChannelInterface
+   */
+  protected $logger;
+
+  /**
    * Constructs a MigrationAlterer.
    *
    * @param \Drupal\Core\Entity\EntityTypeManagerInterface $entity_type_manager
    *   The entity type manager.
+   * @param \Drupal\Core\Entity\EntityFieldManagerInterface $entity_field_manager
+   *   The entity field manager.
+   * @param \Drupal\migrate\Plugin\MigratePluginManagerInterface $source_plugin_manager
+   *   The migrate source plugin manager.
+   * @param \Drupal\migrate\Plugin\MigratePluginManagerInterface $destination_plugin_manager
+   *   The migrate destination plugin manager.
+   * @param \Drupal\Core\Logger\LoggerChannelInterface $logger
+   *   The logger to use.
    */
-  public function __construct(EntityTypeManagerInterface $entity_type_manager) {
+  public function __construct(EntityTypeManagerInterface $entity_type_manager, EntityFieldManagerInterface $entity_field_manager, MigratePluginManagerInterface $source_plugin_manager, MigratePluginManagerInterface $destination_plugin_manager, LoggerChannelInterface $logger) {
     $this->entityTypeManager = $entity_type_manager;
+    $this->entityFieldManager = $entity_field_manager;
+    $this->sourcePluginManager = $source_plugin_manager;
+    $this->destinationPluginManager = $destination_plugin_manager;
+    $this->logger = $logger;
   }
 
   /**
@@ -167,16 +233,34 @@ final class MigrationAlterer {
    *   enriched with some meta information added during discovery phase.
    */
   public function refineMigrationLabel(array &$migration) {
-    if (!isset($migration['deriver']) || !isset($migration['destination']['plugin'])  || strpos($migration['destination']['plugin'], ':') === FALSE) {
-      // Not a derived migration; invalid migration without a source plugin, or
+    if (!isset($migration['destination']['plugin'])  || strpos($migration['destination']['plugin'], ':') === FALSE) {
+      // Invalid migration without a destination plugin, or
       // no ':' delimiter in the destination plugin – nothing to do.
       return;
     }
 
-    $entity_destination_base_plugin_ids = ['entity_complete', 'entity'];
+    $entity_destination_base_plugin_ids = [
+      'entity',
+      'entity_complete',
+    ];
 
-    list($base_plugin_id, $target_entity_type_id) = explode(':', $migration['destination']['plugin']);
+    [
+      $base_plugin_id,
+      $target_entity_type_id,
+    ] = explode(':', $migration['destination']['plugin']);
     if (empty($target_entity_type_id) || !in_array($base_plugin_id, $entity_destination_base_plugin_ids, TRUE)) {
+      return;
+    }
+
+    // Construct a custom label for webform and webform submission migrations.
+    // @todo Consider creating derivatives of this migration based on data in https://backlog.acquia.com/browse/OCTO-3676
+    if ($target_entity_type_id === 'webform_submission') {
+      $migration['label'] = $this->t('Webform submissions (including webforms)');
+      return;
+    }
+
+    if (!isset($migration['deriver'])) {
+      // Not a derived migration.
       return;
     }
 
@@ -346,8 +430,8 @@ final class MigrationAlterer {
 
       $destination = isset($migration_data['destination']['plugin']) ? $migration_data['destination']['plugin'] : NULL;
       $source_type = $migration_data['source']['type'] ?? $migration_data['source']['source_field_type'] ?? NULL;
-      $source_scheme = $migration_data['source']['scheme'] ?? NULL;
-      $source_plugin_is_media_source = in_array($migration_data['source']['plugin'], ['d7_file_entity_item', 'd7_file_plain'], TRUE);
+      $media_source_plugin_ids = ['d7_file_entity_item', 'd7_file_plain'];
+      $source_plugin_is_media_source = in_array($migration_data['source']['plugin'], $media_source_plugin_ids, TRUE);
 
       if (!$source_plugin_is_media_source || $destination !== 'entity:media' || !$source_type) {
         continue;
@@ -381,13 +465,11 @@ final class MigrationAlterer {
         // also by source bundle. We have to remove them and add the ID of the
         // corresponding migration derivative instead.
         $migration_dependencies_to_remove = [
-          'd7_file_entity_type',
           'd7_view_modes',
           'd7_field',
           'd7_field_instance',
           'd7_field_instance_widget_settings',
           'd7_field_formatter_settings',
-          'd7_media_source_field_config',
         ];
         foreach ($migration_dependencies_to_remove as $migration_dependency_to_remove) {
           $dependency_key = array_search($migration_dependency_to_remove, $migration_data['migration_dependencies']['required']);
@@ -396,24 +478,14 @@ final class MigrationAlterer {
           }
         }
 
-        // When a media migration migrates private files, it should depend on
-        // the private file migration.
-        $private_files_migration_id = $source_scheme === 'private' ? 'd7_file_private' : NULL;
-
-        $migration_data['migration_dependencies']['required'] = array_unique(array_values($migration_data['migration_dependencies']['required']) + array_filter([
+        $migration_data['migration_dependencies']['required'] = array_unique(array_merge(array_values($migration_data['migration_dependencies']['required']), [
           'd7_user',
           'd7_media_view_modes',
           'd7_view_modes:file',
           'd7_field:file',
-          "d7_media_source_field_config:$source_type:$source_scheme",
-          "d7_file_entity_type:$source_type:$source_scheme",
           "d7_field_instance_widget_settings:file:$source_type",
           "d7_field_formatter_settings:file:$source_type",
           "d7_field_instance:file:$source_type",
-          // Every media migration should depend on the public files migration
-          // since the media thumbnails will be public files.
-          'd7_file',
-          $private_files_migration_id,
         ]));
       }
 
@@ -652,6 +724,217 @@ final class MigrationAlterer {
   }
 
   /**
+   * Omits field-related migrations for missing entity types.
+   *
+   * @param array[] $migrations
+   *   An associative array of migrations keyed by migration ID, the same that
+   *   is passed to hook_migration_plugins_alter() hooks.
+   */
+  public function omitFieldMigrationsForMissingEntityTypes(array &$migrations) {
+    $omitted_migration_plugin_ids = [];
+
+    foreach ($migrations as $migration_id => $migration_data) {
+      $base_plugin_id = $migration_data['id'];
+      if (!in_array($base_plugin_id, self::FIELD_MIGRATION_PLUGIN_IDS, TRUE)) {
+        continue;
+      }
+
+      $source_entity_type_id = $migration_data['source']['entity_type'];
+      $destination_entity_type_id = isset(self::ENTITY_TYPE_KNOWN_REMAP[$source_entity_type_id])
+        ? self::ENTITY_TYPE_KNOWN_REMAP[$source_entity_type_id]
+        : $source_entity_type_id;
+
+      if (!$this->entityTypeManager->hasDefinition($destination_entity_type_id)) {
+        unset($migrations[$migration_id]);
+        $omitted_migration_plugin_ids[$destination_entity_type_id][] = $migration_id;
+      }
+    }
+
+    foreach ($omitted_migration_plugin_ids as $entity_type_id => $ids) {
+      $this->logger->debug('Omitted @count field-related migration plugin (@migration-plugin-ids) because the entity type "@entity-type-id" does not exist on the destination site.', [
+        '@count' => count($ids),
+        '@migration-plugin-ids' => implode(', ', $ids),
+        '@entity-type-id' => $entity_type_id,
+      ]);
+    }
+  }
+
+  /**
+   * Sets the high_water_property or track_changes on all migrations.
+   *
+   * This will set the `track_changes` migration source property to TRUE, unless
+   * one of two things are true. Either 1) the migration already has a the
+   * `track_changes` or `high_water_property` configured or 2) the migrate
+   * destination is A) a content entity and B) that entity has a property to
+   * record the last modified time (usually this property is named `changed`)
+   * and C) that property is mapped to a migrate source property.
+   *
+   * In almost every circumstance, it is preferable to use the
+   * `high_water_property` feature instead of the `track_changes` feature
+   * because it is significantly more efficient to load and import new and
+   * modified content. The `track_changes` feature requires that *every* source
+   * row be loaded, hashed, and compared to a previous hash of that row which
+   * can lead to many unnecessary computations for unchanged content. On the
+   * other hand, the `high_water_property` feature means that *only* new and
+   * modified rows will be loaded from the database. On a site with many
+   * thousands of rows and infrequently changing content, the `track_changes`
+   * feature may take minutes or hours to "refresh" a migration and only seconds
+   * to achieve the same results using the `high_water_property` feature.
+   *
+   * Unfortunately, not all source rows have the necessary information to make
+   * the `high_water_property` feature viable. To be viable, the source row must
+   * have a value that increments every time that row changes. The canonical
+   * example is a timestamp recorded when the content was modified. For Drupal
+   * entities, this is is typically a "changed" field. Nearly all content
+   * entities have this field as of Drupal 8, but not all of their corresponding
+   * entities in Drupal 7 have this information recorded. Users and custom
+   * blocks are the most salient examples and so their migrations must fall back
+   * to the `track_changes` feature.
+   *
+   * @param array[] $migrations
+   *   An associative array of migrations keyed by migration ID, the same that
+   *   is passed to hook_migration_plugins_alter() hooks.
+   */
+  public function addChangeTracking(array &$migrations) {
+    foreach ($migrations as $migration_id => $definition) {
+      // Only add change tracking to Drupal 7 migrations.
+      $is_drupal_7_migration = !empty($definition['migration_tags']) && is_array($definition['migration_tags']) && in_array('Drupal 7', $definition['migration_tags'], TRUE);
+      if (!$is_drupal_7_migration) {
+        continue;
+      }
+      // Only continue if the migration plugin already has a change tracking
+      // option set up.
+      if (isset($migrations[$migration_id]['source']['high_water_property']) || isset($migrations[$migration_id]['source']['track_changes'])) {
+        continue;
+      }
+      // Determine if the migration's destination is a content entity. If not,
+      // fall back to using the track_changes feature since the migration plugin
+      // is likely importing configuration.
+      $destination_plugin_id = $definition['destination']['plugin'] ?? NULL;
+      if (!$destination_plugin_id) {
+        $migrations[$migration_id]['source']['track_changes'] = TRUE;
+        continue;
+      }
+      $destination_plugin_definition = $this->destinationPluginManager->getDefinition($destination_plugin_id, FALSE);
+      $destination_plugin_class = $destination_plugin_definition['class'] ?? NULL;
+      if (!$destination_plugin_class) {
+        $migrations[$migration_id]['source']['track_changes'] = TRUE;
+        continue;
+      }
+      if (!is_a($destination_plugin_class, EntityContentBase::class, TRUE)) {
+        $migrations[$migration_id]['source']['track_changes'] = TRUE;
+        continue;
+      }
+      // Determine if the destination content entity has a field to track last
+      // modified time. If not, fall back to using the track_changes feature.
+      $destination_entity_type_id = array_pad(explode(Entity::DERIVATIVE_SEPARATOR, $destination_plugin_id), 2, NULL)[1];
+      if (!$destination_entity_type_id) {
+        $migrations[$migration_id]['source']['track_changes'] = TRUE;
+        continue;
+      }
+      $destination_base_fields = $this->entityFieldManager->getBaseFieldDefinitions($destination_entity_type_id);
+      $changed_fields = array_filter($destination_base_fields, function (BaseFieldDefinition $base_field_definition) {
+        return $base_field_definition->getType() === 'changed';
+      });
+      if (count($changed_fields) !== 1) {
+        assert(count($changed_fields) < 2, sprintf('Entities should not have more than one changed field. The %s entity type violates that assumption.', $destination_entity_type_id));
+        $migrations[$migration_id]['source']['track_changes'] = TRUE;
+        continue;
+      }
+      // Since the destination has a changed field, determine if it is mapped to
+      // a source field. If it is, then use that source field as a high water
+      // property. If not, fall back to using the track_changes feature.
+      $changed_field = current($changed_fields);
+      assert($changed_field instanceof BaseFieldDefinition);
+      $field_name = $changed_field->getName();
+      $mapping = $definition['process'][$field_name] ?? NULL;
+      if (!$mapping) {
+        $migrations[$migration_id]['source']['track_changes'] = TRUE;
+        continue;
+      }
+      $source_field = is_array($mapping) ? ($mapping['source'] ?? NULL) : $mapping;
+      if (!$source_field) {
+        $migrations[$migration_id]['source']['track_changes'] = TRUE;
+        continue;
+      }
+      $source_plugin_id = $definition['source']['plugin'] ?? NULL;
+      // A source field mapping has been identified. Now ensure that the source
+      // plugin actually provides this field. Unfortunately, this is not
+      // guaranteed by the core migrate system.
+      try {
+        $stub_migration_plugin = new StubMigrationPlugin();
+        $source_plugin = $this->sourcePluginManager->createInstance($source_plugin_id, $definition['source'], $stub_migration_plugin);
+      }
+      catch (PluginException $e) {
+        $migrations[$migration_id]['source']['track_changes'] = TRUE;
+        continue;
+      }
+      if (!$source_plugin instanceof MigrateSourceInterface) {
+        $migrations[$migration_id]['source']['track_changes'] = TRUE;
+        continue;
+      }
+      $fields = $source_plugin->fields();
+      if (!isset($fields[$source_field])) {
+        $migrations[$migration_id]['source']['track_changes'] = TRUE;
+        continue;
+      }
+      $migrations[$migration_id]['source']['high_water_property'] = [
+        'name' => $source_field,
+      ];
+
+      // When the source plugin queries multiple tables and multiple tables have
+      // the source plugin's high_water_property source field name as one of
+      // their columns, then set the optional `alias` to ensure the correct
+      // table alias is specified. Otherwise the SQL query will fail due to an
+      // ambiguous query.
+      if (count($source_plugin->query()->getTables()) > 1) {
+        $selected_table_alias = NULL;
+        $tables = $source_plugin->query()->getTables();
+        $schema = $source_plugin->getDatabase()->schema();
+        // Determine in which tables in the query the high_water_property column
+        // exists.
+        $candidate_table_aliases = [];
+        foreach ($tables as $alias => $table_info) {
+          if ($schema->fieldExists($table_info['table'], $source_field)) {
+            $candidate_table_aliases[$table_info['table']] = $alias;
+          }
+        }
+        // Only add an alias if the high_water_property column truly exists in
+        // multiple tables.
+        if (count($candidate_table_aliases) > 1) {
+          $base_migration_plugin_id = $definition['id'];
+          $selected_table_alias = NULL;
+          $is_heuristic = FALSE;
+          switch ($base_migration_plugin_id) {
+            case 'd7_comment':
+              // @see \Drupal\comment\Plugin\migrate\source\d7\Comment::query()
+              $selected_table_alias = 'c';
+              break;
+
+            default:
+              $selected_table_alias = reset(array_keys($candidate_table_aliases));
+              $is_heuristic = TRUE;
+              break;
+          }
+          $level = $is_heuristic
+            ? RfcLogLevel::WARNING
+            : RfcLogLevel::DEBUG;
+          $this->logger->log($level, 'The high_water_property "@column-name" for the base migration plugin "@migration-plugin-id" occurred in @count tables in the query, of which @count-column contain this column. The alias "@alias" for the table "@table" was selected. (@known-or-heuristic)', [
+            '@column-name' => $source_field,
+            '@migration-plugin-id' => $migration_id,
+            '@count' => count($tables),
+            '@count-column' => count($candidate_table_aliases),
+            '@alias' => $selected_table_alias,
+            '@table' => $tables[$selected_table_alias]['table'],
+            '@known-or-heuristic' => $is_heuristic ? 'Heuristic, should be investigated and hardcode a known disambiguation.' : 'Known ambiguity.',
+          ]);
+          $migrations[$migration_id]['source']['high_water_property']['alias'] = $selected_table_alias;
+        }
+      }
+    }
+  }
+
+  /**
    * Converts a migration process definition to an array of processes.
    *
    * @param array|string $process
@@ -674,6 +957,28 @@ final class MigrationAlterer {
     }
 
     return $process;
+  }
+
+}
+
+/**
+ * StubMigrationPlugin to allow inspecting @MigrateSource plugins.
+ */
+class StubMigrationPlugin extends MigrationPlugin {
+
+  /**
+   * StubMigrationPlugin constructor.
+   */
+  public function __construct() {
+    // Intentionally ignore parent constructor.
+  }
+
+  /**
+   * {@inheritdoc}
+   */
+  public function getIdMap() {
+    // Avoid creating an ID map plugin.
+    return NULL;
   }
 
 }
