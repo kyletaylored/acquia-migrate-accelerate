@@ -4,19 +4,27 @@
     "description": "An enhanced UI and assistant for Drupal migrations. See https://www.acquia.com/drupal9/accelerate-your-migration.",
     "homepage": "https://www.acquia.com/drupal9/accelerate-your-migration",
     "require": {
-        "acquia/drupal-environment-detector": "^1.1.0",
-        "drupal/decoupled_pages": "^1.0-beta0",
+        "acquia/drupal-environment-detector": "^1.2",
+        "composer/semver": "^3.0",
+        "drupal/core": "^9.0.6",
+        "drupal/decoupled_pages": "^1.0",
         "drupal/migrate_plus": "^5",
-        "league/uri": "^6.2.1",
+        "league/uri": "^6.3",
         "league/uri-components": "^2.2.1"
     },
     "require-dev": {
         "acquia/coding-standards": "dev-master",
         "dealerdirect/phpcodesniffer-composer-installer": "dev-master",
         "ergebnis/composer-normalize": "^2.0.0",
+        "phpspec/prophecy-phpunit": "^2",
         "squizlabs/php_codesniffer": "^3.0@dev"
     },
     "extra": {
+        "drush": {
+            "services": {
+                "drush.services.yml": "^10"
+            }
+        },
         "patches": {
             "drupal/core": {
                 "Avoid https://www.drupal.org/project/drupal/issues/2796755 breaking this module": "https://gist.githubusercontent.com/wimleers/4c8742d5efb74ea5dad1475b4478bd40/raw/99e35617a292b730fdbb36be4f3ce48d5c9863a1/migration-metadata.patch",
@@ -25,7 +33,7 @@
         },
         "phpcodesniffer-search-depth": 4
     },
-    "minimum-stability": "dev",
+    "minimum-stability": "stable",
     "prefer-stable": true,
     "scripts": {
         "composer-normalize": "composer normalize '--indent-size=4' '--indent-style=space' --ansi",

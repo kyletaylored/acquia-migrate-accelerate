@@ -4,6 +4,8 @@ namespace Drupal\acquia_migrate\Controller;
 
 use Drupal\acquia_migrate\Batch\BatchUnknown;
 use Drupal\acquia_migrate\Batch\MigrationBatchManager;
+use Drupal\acquia_migrate\EventSubscriber\InstantaneousBatchInterruptor;
+use Drupal\acquia_migrate\EventSubscriber\ServerTimingHeaderForResponseSubscriber;
 use Drupal\acquia_migrate\Exception\AcquiaMigrateHttpExceptionInterface;
 use Drupal\acquia_migrate\Exception\BadRequestHttpException;
 use Drupal\acquia_migrate\Exception\FailedAtomicOperationException;
@@ -20,13 +22,17 @@ use Drupal\acquia_migrate\MigrationPreviewer;
 use Drupal\acquia_migrate\MigrationRepository;
 use Drupal\acquia_migrate\ModuleAuditor;
 use Drupal\acquia_migrate\Plugin\migrate\id_map\SqlWithCentralizedMessageStorage;
+use Drupal\acquia_migrate\Recommendations;
+use Drupal\acquia_migrate\Timers;
 use Drupal\acquia_migrate\UriDefinitions;
 use Drupal\Component\Serialization\Json;
 use Drupal\Component\Utility\NestedArray;
+use Drupal\Component\Utility\Timer;
 use Drupal\Core\Cache\CacheableJsonResponse;
 use Drupal\Core\Cache\CacheableMetadata;
 use Drupal\Core\Config\ConfigFactoryInterface;
 use Drupal\Core\Database\Connection;
+use Drupal\Core\Database\Database;
 use Drupal\Core\Lock\LockBackendInterface;
 use Drupal\Core\Logger\RfcLogLevel;
 use Drupal\Core\StringTranslation\StringTranslationTrait;
@@ -213,6 +219,13 @@ final class HttpApi {
   protected $migrationFingerprinter;
 
   /**
+   * The recommendations.
+   *
+   * @var \Drupal\acquia_migrate\Recommendations
+   */
+  protected $recommendations;
+
+  /**
    * The persistent lock which is used to lock across requests.
    *
    * @var \Drupal\Core\Lock\LockBackendInterface
@@ -240,12 +253,14 @@ final class HttpApi {
    *   The module auditor.
    * @param \Drupal\acquia_migrate\MigrationFingerprinter $migration_fingerprinter
    *   The migration fingerprinter.
+   * @param \Drupal\acquia_migrate\Recommendations $recommendations
+   *   The recommendations.
    * @param \Drupal\Core\Config\ConfigFactoryInterface $config_factory
    *   The config factory.
    * @param \Drupal\Core\Lock\LockBackendInterface $persistent_lock
    *   A persistent lock backend instance.
    */
-  public function __construct(MigrationRepository $repository, MigrationBatchManager $batch_manager, Connection $connection, MigrationPreviewer $migration_previewer, MigrationMappingViewer $migration_mapping_viewer, MigrationMappingManipulator $migration_mapping_manipulator, MessageAnalyzer $message_analyzer, ModuleAuditor $module_auditor, MigrationFingerprinter $migration_fingerprinter, ConfigFactoryInterface $config_factory, LockBackendInterface $persistent_lock) {
+  public function __construct(MigrationRepository $repository, MigrationBatchManager $batch_manager, Connection $connection, MigrationPreviewer $migration_previewer, MigrationMappingViewer $migration_mapping_viewer, MigrationMappingManipulator $migration_mapping_manipulator, MessageAnalyzer $message_analyzer, ModuleAuditor $module_auditor, MigrationFingerprinter $migration_fingerprinter, Recommendations $recommendations, ConfigFactoryInterface $config_factory, LockBackendInterface $persistent_lock) {
     $this->repository = $repository;
     $this->migrationBatchManager = $batch_manager;
     $this->connection = $connection;
@@ -255,6 +270,7 @@ final class HttpApi {
     $this->messageAnalyzer = $message_analyzer;
     $this->moduleAuditor = $module_auditor;
     $this->migrationFingerprinter = $migration_fingerprinter;
+    $this->recommendations = $recommendations;
     $this->configFactory = $config_factory;
     $this->persistentLock = $persistent_lock;
   }
@@ -326,16 +342,18 @@ final class HttpApi {
    *
    * @return \Symfony\Component\HttpFoundation\JsonResponse
    *   The response.
-   *
-   * @TODO Make sure to invalidate if cached whenever migration plugins are
-   * rebuilt.
-   * @see \Drupal\node\Plugin\migrate\D7NodeTranslation::generateFollowUpMigrations
    */
   public function migrationsCollection(Request $request): JsonResponse {
+    Timer::start(Timers::RESPONSE_MIGRATIONS_COLLECTION);
+    Database::startLog(Timers::RESPONSE_MIGRATIONS_COLLECTION . '-dst', 'default');
+    Database::startLog(Timers::RESPONSE_MIGRATIONS_COLLECTION . '-src', 'migrate');
+
     // @see system_cron() — we want this to run more frequently and more
     // reliably than cron so that expired locks are quickly cleaned up.
     // @codingStandardsIgnoreLine
+    Timer::start(Timers::QUERY_LOCK_GC);
     \Drupal::service('keyvalue.expirable.database')->garbageCollection();
+    Timer::stop(Timers::QUERY_LOCK_GC);
 
     $this->validateRequest($request);
     $cacheability = new CacheableMetadata();
@@ -356,6 +374,9 @@ final class HttpApi {
         'self' => [
           'href' => $request->getUri(),
         ],
+      ],
+      'meta' => [
+        'sourceSyncTime' => $this->recommendations->getRecentInfoTime(),
       ],
     ];
     $bulk_update_url = Url::fromRoute('acquia_migrate.api.migrations.bulk_update')
@@ -464,6 +485,13 @@ final class HttpApi {
     }
     $response = CacheableJsonResponse::create($document, 200, static::$defaultResponseHeaders);
     $response->addCacheableDependency($cacheability);
+
+    Timer::stop(Timers::RESPONSE_MIGRATIONS_COLLECTION);
+    $dst_queries = Database::getLog(Timers::RESPONSE_MIGRATIONS_COLLECTION . '-dst', 'default');
+    ServerTimingHeaderForResponseSubscriber::trackQueryLog(Timers::RESPONSE_MIGRATIONS_COLLECTION . '-dst', count($dst_queries));
+    $src_queries = Database::getLog(Timers::RESPONSE_MIGRATIONS_COLLECTION . '-src', 'migrate');
+    ServerTimingHeaderForResponseSubscriber::trackQueryLog(Timers::RESPONSE_MIGRATIONS_COLLECTION . '-src', count($src_queries));
+
     return $response;
   }
 
@@ -990,14 +1018,19 @@ final class HttpApi {
     if (!$data) {
       throw new BadRequestHttpException('Request document is missing the data member.');
     }
-    // @todo Allow PATCHing of more fields than only the "completed" and "skipped" attributes.
-    if (isset($data['relationships']) || !empty(array_diff(array_keys($data['attributes']), ['completed', 'skipped']))) {
+    // @todo Allow PATCHing of more fields.
+    $patchable_attributes = [
+      'activity',
+      'completed',
+      'skipped',
+    ];
+    if (isset($data['relationships']) || !empty(array_diff(array_keys($data['attributes']), $patchable_attributes))) {
       return JsonResponse::create([
         'errors' => [
           [
             'code' => (string) 403,
             'status' => Response::$statusTexts[403],
-            'detail' => 'Only the `completed` and `skipped` fields can be updated.',
+            'detail' => 'Only the `activity`, `completed` and `skipped` fields can be updated.',
             'links' => [
               'via' => [
                 'href' => $request->getUri(),
@@ -1006,6 +1039,49 @@ final class HttpApi {
           ],
         ],
       ], 403, static::$defaultResponseHeaders);
+    }
+
+    if (isset($data['attributes']['activity'])) {
+      $new_activity = $data['attributes']['activity'];
+      unset($data['attributes']['activity']);
+
+      // Only allow stopping the current activity.
+      if ($new_activity !== Migration::ACTIVITY_IDLE) {
+        return JsonResponse::create([
+          'errors' => [
+            [
+              'code' => (string) 403,
+              'status' => Response::$statusTexts[403],
+              'detail' => "Only 'idle' is allowed for the `activity` attribute.",
+              'links' => [
+                'via' => [
+                  'href' => $request->getUri(),
+                ],
+              ],
+            ],
+          ],
+        ], 403, static::$defaultResponseHeaders);
+      }
+      elseif ($migration->getActivity() === Migration::ACTIVITY_IDLE) {
+        return JsonResponse::create([
+          'errors' => [
+            [
+              'code' => (string) 409,
+              'status' => Response::$statusTexts[409],
+              'detail' => "The migration already has its `activity` attribute set to 'idle'.",
+              'links' => [
+                'via' => [
+                  'href' => $request->getUri(),
+                ],
+              ],
+            ],
+          ],
+        ], 409, static::$defaultResponseHeaders);
+      }
+
+      // @see \Drupal\acquia_migrate\EventSubscriber\InstantaneousBatchInterruptor
+      // @codingStandardsIgnoreLine
+      \Drupal::state()->set(InstantaneousBatchInterruptor::KEY, TRUE);
     }
 
     foreach ($data['attributes'] as $attribute => $value) {
@@ -1153,6 +1229,8 @@ final class HttpApi {
    *   The response.
    */
   public function messagesCollection(Request $request): JsonResponse {
+    Timer::start(Timers::RESPONSE_MESSAGES_COLLECTION);
+
     $this->validateRequest($request, [
       'optional' => ['filter'],
     ]);
@@ -1164,7 +1242,7 @@ final class HttpApi {
     $categories = $this->getFilterCategories();
     $generated_messages_url = Url::fromRoute('acquia_migrate.api.messages.get')->setAbsolute()->toString(TRUE);
     $cacheability->addCacheableDependency($generated_messages_url);
-    return (new CacheableJsonResponse([
+    $response = (new CacheableJsonResponse([
       'data' => $data,
       'links' => [
         'self' => [
@@ -1226,6 +1304,8 @@ final class HttpApi {
     ], 200, array_merge(static::$defaultResponseHeaders, [
       'Content-Type' => 'application/vnd.api+json; ext="' . UriDefinitions::EXTENSION_URI_TEMPLATE . '"',
     ])))->addCacheableDependency($cacheability);
+    Timer::stop(Timers::RESPONSE_MESSAGES_COLLECTION);
+    return $response;
   }
 
   /**
@@ -1246,7 +1326,8 @@ final class HttpApi {
       'required' => ['migrationId'],
     ]);
 
-    if (!$this->persistentLock->lockMayBeAvailable(static::ACTIVE_BATCH)) {
+    $lock_acquired = $this->persistentLock->acquire(static::ACTIVE_BATCH, ini_get('max_execution_time') * 2);
+    if (!$lock_acquired) {
       return JsonResponse::create([
         'errors' => [
           [
@@ -1323,7 +1404,6 @@ final class HttpApi {
       // @todo: should this be a cacheable response? If so, we'll need to mint and invalidate a cache tag for it.
       return JsonResponse::create(NULL, 404, static::$defaultResponseHeaders);
     }
-    $this->persistentLock->acquire(static::ACTIVE_BATCH, ini_get('max_execution_time') * 2);
     $data = [
       'type' => 'migrationProcess',
       'id' => (string) $process_id,
@@ -1334,6 +1414,12 @@ final class HttpApi {
     $self_url = Url::fromUri($request->getUri())->setAbsolute();
     $links = ['self' => ['href' => $self_url->toString()]];
     if ($batch_status->getProgress() < 1) {
+      // If the currently active migration operation (which runs in a batch) is
+      // interrupted, then the persistent lock must be released. Unfortunately,
+      // a batch contains multiple migration plugin instances to execute, and
+      // the interruption happens at that level. So while the lock must also be
+      // released in this case, we cannot do it here.
+      // @see \Drupal\acquia_migrate\EventSubscriber\InstantaneousBatchInterruptor::interruptMigrateExecutable
       $links['next'] = ['href' => $self_url->toString()];
     }
     else {

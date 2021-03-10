@@ -5,6 +5,8 @@ namespace Drupal\acquia_migrate\Plugin\migrate\id_map;
 use Drupal\acquia_migrate\Controller\HttpApi;
 use Drupal\acquia_migrate\MessageAnalyzer;
 use Drupal\acquia_migrate\Migration;
+use Drupal\acquia_migrate\Timers;
+use Drupal\Component\Utility\Timer;
 use Drupal\Core\Logger\LoggerChannelInterface;
 use Drupal\Core\Logger\RfcLogLevel;
 use Drupal\migrate\Plugin\migrate\id_map\Sql;
@@ -449,6 +451,34 @@ final class SqlWithCentralizedMessageStorage extends Sql {
     }
 
     return $this->processedCount();
+  }
+
+  /**
+   * Gets all unimported rows: processed but not imported: failed, skipped, etc.
+   *
+   * @return array
+   *   The raw DB rows.
+   */
+  public function getUnimportedRows() {
+    $rows = [];
+    $result = $this->getDatabase()->select($this->mapTableName(), 'map')
+      ->fields('map')
+      ->condition('source_row_status', MigrateIdMapInterface::STATUS_IMPORTED, '!=')
+      ->execute();
+    foreach ($result as $row) {
+      $rows[] = $row;
+    }
+    return $rows;
+  }
+
+  /**
+   * {@inheritdoc}
+   */
+  protected function countHelper($status = NULL, $table = NULL) {
+    Timer::start(Timers::COUNT_ID_MAP);
+    $result = parent::countHelper($status, $table);
+    Timer::stop(Timers::COUNT_ID_MAP);
+    return $result;
   }
 
 }

@@ -2,13 +2,15 @@
 
 namespace Drupal\acquia_migrate;
 
+use Drupal\acquia_migrate\Clusterer\Heuristics\SharedLanguageConfig;
+use Drupal\acquia_migrate\Exception\RowPreviewException;
 use Drupal\acquia_migrate\Plugin\migrate\id_map\SqlWithCentralizedMessageStorage;
 use Drupal\Component\Assertion\Inspector;
 use Drupal\Component\Plugin\PluginBase;
+use Drupal\Component\Utility\Timer;
 use Drupal\Core\Cache\RefinableCacheableDependencyInterface;
 use Drupal\Core\GeneratedUrl;
 use Drupal\Core\Url;
-use Drupal\filter\Render\FilteredMarkup;
 use Drupal\migrate\Exception\RequirementsException;
 use Drupal\migrate\Plugin\Migration as MigrationPlugin;
 use Drupal\migrate\Plugin\MigrationInterface;
@@ -19,6 +21,13 @@ use Drupal\migrate\Plugin\MigrationInterface;
  * @internal
  */
 final class Migration {
+
+  /**
+   * The regular expression pattern that migration IDs conform to.
+   *
+   * @var string
+   */
+  const ID_PATTERN = '/^[a-f0-9]{32}-[^\/]{1,192}$/';
 
   /**
    * Nothing is happening for this migration.
@@ -163,6 +172,9 @@ final class Migration {
    *   The duration in seconds of the last import, if any.
    */
   public function __construct(string $id, string $label, array $dependencies, array $migration_plugins, array $data_migration_plugin_ids, bool $completed, bool $skipped, string $last_import_fingerprint, string $last_computed_fingerprint, ?int $last_import_timestamp, ?int $last_import_duration) {
+    if (!preg_match(static::ID_PATTERN, $id)) {
+      throw new \InvalidArgumentException("Invalid migration ID: $id.");
+    }
     $this->id = $id;
     $this->label = $label;
     assert(Inspector::assertAllStrings(array_keys($dependencies)));
@@ -170,7 +182,6 @@ final class Migration {
     assert(Inspector::assertAllObjects($migration_plugins, MigrationPlugin::class));
     $this->migrationPlugins = $migration_plugins;
     assert(Inspector::assertAllStrings($data_migration_plugin_ids));
-    assert(array_diff(array_keys(array_splice($migration_plugins, count($migration_plugins) - count($data_migration_plugin_ids))), $data_migration_plugin_ids) === [], 'The data migration plugin are executed last for migration ' . $id . ' — (all migration plugins: ' . implode(', ', array_keys($migration_plugins)) . ', data migration plugins: ' . implode(', ', $data_migration_plugin_ids) . '.');
     $this->dataMigrationPluginIds = $data_migration_plugin_ids;
     $this->completed = $completed;
     $this->skipped = $skipped;
@@ -225,6 +236,7 @@ final class Migration {
       $this->migrationPlugins[$id] = $all_migration_plugins[$id];
     }
     $this->_migrationPlugins = [];
+
     $this->dependencies = [];
     foreach ($this->_dependencies as $key => $dependency_migration_plugin_ids) {
       foreach (array_keys($dependency_migration_plugin_ids) as $id) {
@@ -261,6 +273,72 @@ final class Migration {
    */
   public function label() : string {
     return $this->label;
+  }
+
+  /**
+   * Generates a migration ID from the provided migration label.
+   *
+   * @return string
+   *   A migration ID.
+   *
+   * @see ::labelForId()
+   * @see \Drupal\acquia_migrate\Plugin\migrate\destination\RollbackableInterface::ROLLBACK_DATA_TABLE
+   * @see acquia_migrate_schema()
+   */
+  public static function generateIdFromLabel(string $label) : string {
+    // Generates an opaque identifier with a legible suffix at the end, to
+    // balance:
+    // - not baking in assumptions as we get this project off the ground
+    // - easier debugging while we get this project off the ground
+    // The intent is to change the opaque identifiers in the future, and if they
+    // truly are treated as opaque, that will be easy to do. This opaque
+    // identifier must be at most 225 ASCII characters long due to MySQL 5.6
+    // restrictions (767-255-255-32). An MD5-hash is 32 characters, the dash is
+    // one and that leaves 192 characters of the label.
+    $migration_id = md5($label) . '-' . substr(str_replace('/', '-', $label), 0, 192);
+    assert(static::isValidMigrationId($migration_id));
+    return $migration_id;
+  }
+
+  /**
+   * Checks whether the given string is a valid migration ID.
+   *
+   * @param string $potential_migration_id
+   *   A string to evaluate.
+   *
+   * @return bool
+   *   Whether the given string is a valid migration ID.
+   */
+  public static function isValidMigrationId(string $potential_migration_id) : bool {
+    return preg_match(Migration::ID_PATTERN, $potential_migration_id);
+  }
+
+  /**
+   * Gets the migration label for a given migration ID.
+   *
+   * @param string $migration_id
+   *   A migration ID.
+   *
+   * @return string
+   *   The corresponding migration label.
+   *
+   * @see ::generateIdFromLabel()
+   */
+  public static function labelForId(string $migration_id) : string {
+    assert(preg_match(static::ID_PATTERN, $migration_id));
+    return explode('-', $migration_id, 2)[1];
+  }
+
+  /**
+   * Whether this is a supporting config-only migration.
+   *
+   * @return bool
+   *   TRUE if this is a migration containing no data, but only supporting
+   *   configuration.
+   */
+  public function isSupportingConfigOnly() : bool {
+    // @todo Somehow tie this to \Drupal\acquia_migrate\Clusterer\Heuristics\SharedEntityStructure?
+    return $this->label === SharedLanguageConfig::cluster() || strpos($this->label, 'Shared structure for ') !== FALSE;
   }
 
   /**
@@ -415,7 +493,7 @@ final class Migration {
    * essential to any successful migration.
    *
    * @return bool
-   *   TRUE if the migration is preseletable, FALSE otherwise.
+   *   TRUE if the migration is preselectable, FALSE otherwise.
    *
    * @see \Drupal\Component\Plugin\PluginBase::getBaseId()
    */
@@ -492,6 +570,26 @@ final class Migration {
    *   The duration, if any.
    */
   public function getLastImportDuration() : ?int {
+    // Ensure the last import duration is always up-to-date.
+    // @todo Somehow we can get a Migration object with a stale "last import
+    // duration" value, even though it is never cached: not in Page Cache,
+    // Dynamic Page Cache, HttpApi, MigrationConverter or MigrationRepository.
+    // For now, this work-around solves the mystery…
+    // @codingStandardsIgnoreStart
+    $before = $this->lastImportDuration;
+    $fresh_flags = (array) \Drupal::database()->select('acquia_migrate_migration_flags', 'm')
+      ->fields('m', [
+        'migration_id',
+        'last_import_duration',
+      ])
+      ->condition('migration_id', $this->id)
+      ->execute()
+      ->fetchAllAssoc('migration_id')[$this->id];
+    $this->lastImportDuration = $after = $fresh_flags['last_import_duration'];
+    if ($before != $after) {
+      \Drupal::logger('acquia_migrate')->debug('last_import_duration race condition work-around saved the day again: instead of ' . (string) $before . ' it now is ' . (string) $after . ' for the @migration-id migration.', ['@migration-id' => $this->id]);
+    }
+    // @codingStandardsIgnoreEnd
     return $this->lastImportDuration;
   }
 
@@ -502,15 +600,25 @@ final class Migration {
    *   An array of link URLs.
    */
   protected function getAvailableLinkUrls() : array {
-    // If this migration is not idle, do not allow any other activities.
-    if ($this->getActivity() !== self::ACTIVITY_IDLE) {
-      return [];
+    // This may be called repeatedly within a request, but the service will not
+    // change. Hence this is safe to statically cache.
+    static $previewer;
+    if (!isset($previewer)) {
+      $previewer = \Drupal::service('acquia_migrate.previewer');
+      assert($previewer instanceof MigrationPreviewer);
     }
 
     $urls = [];
 
     $update_resource_url = Url::fromRoute('acquia_migrate.api.migration.patch')
       ->setRouteParameter('migration', $this->id());
+
+    // If this migration is not idle, do not allow any other activities, except
+    // stopping the current activity.
+    if ($this->getActivity() !== self::ACTIVITY_IDLE) {
+      $urls['stop'] = $update_resource_url;
+      return $urls;
+    }
 
     // Until preselections have been made, only preselectable migrations should
     // have skip/unskip links. This unintuitive boolean order exists to prevent
@@ -545,11 +653,13 @@ final class Migration {
       ]);
     }
 
-    if (!$this->isCompleted()) {
-      $urls['complete'] = $update_resource_url;
-    }
-    else {
-      $urls['uncomplete'] = $update_resource_url;
+    if ($this->allRowsProcessed()) {
+      if (!$this->isCompleted()) {
+        $urls['complete'] = $update_resource_url;
+      }
+      else {
+        $urls['uncomplete'] = $update_resource_url;
+      }
     }
 
     // It does not make sense to mark an already completed migration as skipped.
@@ -557,12 +667,12 @@ final class Migration {
       $urls['skip'] = $update_resource_url;
     }
 
-    if (\Drupal::service('acquia_migrate.previewer')->isPreviewableMigration($this)) {
+    if ($previewer->isPreviewableMigration($this)) {
       $unmet_requirements = [];
-      // There's nothing to preview if not all dependencies have not had all
-      // their rows processed.
-      if (!$this->allDependencyRowsProcessed()) {
-        $unmet_requirements[] = 'https://github.com/acquia/acquia_migrate#application-concept-no-unprocessed-dependencies';
+      // There's nothing to preview if not all supporting configuration has been
+      // processed.
+      if ($previewer->isReadyForPreview($this)) {
+        $unmet_requirements[] = 'https://github.com/acquia/acquia_migrate#application-concept-no-unprocessed-supporting-configuration';
       }
 
       // If not all requirements are met, then for example previewing an
@@ -580,7 +690,7 @@ final class Migration {
       }
     }
 
-    if (\Drupal::service('acquia_migrate.previewer')->isPreviewableMigration($this)) {
+    if ($previewer->isPreviewableMigration($this)) {
       $urls['field-mapping'] = Url::fromRoute('acquia_migrate.api.migration.mapping')
         ->setRouteParameter('migration', $this->id());
     }
@@ -622,6 +732,7 @@ final class Migration {
         break;
       }
     }
+
     return $all_rows_processed;
   }
 
@@ -647,6 +758,67 @@ final class Migration {
       }
     }
     return $all_dependency_rows_processed;
+  }
+
+  /**
+   * Gets all migration plugins that provide supporting configuration.
+   *
+   * @return array
+   *   An array of key-value pairs of migrations containing supporting
+   *   configuration that this migration depends upon. Keys are migration plugin
+   *   IDs, values are the corresponding migrations.
+   *
+   * @see ::allDependencyRowsProcessed()
+   * @see \Drupal\acquia_migrate\MigrationRepository::getInitialMigrationPluginIds()
+   */
+  public function getSupportingConfigurationMigrationPluginIds() : array {
+    // 1. supporting configuration migration plugin IDs *within* this migration.
+    $non_data_migration_plugin_ids = array_diff($this->getMigrationPluginIds(), $this->getDataMigrationPluginIds());
+    $supporting_config_migration_plugin_ids = array_fill_keys($non_data_migration_plugin_ids, $this->id());
+
+    // Return early if there are no dependencies.
+    if (empty($this->dependencies)) {
+      return $supporting_config_migration_plugin_ids;
+    }
+
+    $repository = \Drupal::service('acquia_migrate.migration_repository');
+    assert($repository instanceof MigrationRepository);
+    $initial_migration_plugin_ids = $repository->getInitialMigrationPluginIds();
+
+    // 2. supporting configuration migration plugin IDs in dependencies.
+    foreach ($this->dependencies as $migration_id => $migration_plugin_dependencies) {
+      foreach ($migration_plugin_dependencies as $migration_plugin_id => $migration_plugin) {
+        // Only consider migration plugins within the dependencies that migrate
+        // supporting configuration.
+        if (!in_array($migration_plugin_id, $initial_migration_plugin_ids, TRUE)) {
+          continue;
+        }
+        $supporting_config_migration_plugin_ids[$migration_plugin_id] = $migration_id;
+      }
+    }
+    return $supporting_config_migration_plugin_ids;
+  }
+
+  /**
+   * Returns subset of supp. conf. mig. plugins: those with rows to process.
+   *
+   * @return array
+   *   An array of key-value pairs of migrations containing supporting
+   *   configuration that this migration depends upon. Keys are migration plugin
+   *   IDs, values are the corresponding migrations.
+   *
+   * @see ::allDependencyRowsProcessed()
+   * @see \Drupal\acquia_migrate\MigrationRepository::getInitialMigrationPluginIds()
+   * @see \Drupal\acquia_migrate\MigrationRepository::getInitialMigrationPluginIdsWithRowsToProcess()
+   */
+  public function getSupportingConfigurationMigrationsPluginIdsWithRowsToProcess() : array {
+    $supporting_config_migration_plugin_ids = $this->getSupportingConfigurationMigrationPluginIds();
+
+    $repository = \Drupal::service('acquia_migrate.migration_repository');
+    assert($repository instanceof MigrationRepository);
+    $todo = $repository->getInitialMigrationPluginIdsWithRowsToProcess();
+
+    return array_intersect_key($supporting_config_migration_plugin_ids, array_combine($todo, $todo));
   }
 
   /**
@@ -686,6 +858,7 @@ final class Migration {
    *   - Migration::ACTIVITY_IDLE
    *   - Migration::ACTIVITY_IMPORTING
    *   - Migration::ACTIVITY_ROLLING_BACK
+   *   - Migration::ACTIVITY_REFRESHING
    */
   public function getActivity() : string {
     $max_migration_plugin_status = array_reduce($this->dataMigrationPluginIds, function (int $max, string $id) {
@@ -711,7 +884,9 @@ final class Migration {
       default:
         // Note that MigrationInterface::STATUS_STOPPING is irrelevant to us,
         // since it is used by MigrateUpgradeImportBatch to signal the end of
-        // the processing within a single batch request.
+        // the processing within a single batch request. It is also used for
+        // instantaneously triggering a stop.
+        // @see \Drupal\acquia_migrate\EventSubscriber\InstantaneousBatchInterruptor::interruptMigrateExecutable
         // Note that MigrationInterface::STATUS_DISABLED is irrelevant to us,
         // since we do not use this functionality and it does not actually
         // reflect an activity.
@@ -732,6 +907,17 @@ final class Migration {
    *   A JSON:API resource object array.
    */
   public static function toResourceObject(Migration $migration, RefinableCacheableDependencyInterface $cacheability) : array {
+    Timer::start(Timers::JSONAPI_RESOURCE_OBJECT_MIGRATION);
+
+    // This may be called repeatedly within a request, but the service will not
+    // change. Hence this is safe to statically cache.
+    static $previewer;
+    if (!isset($previewer)) {
+      $previewer = \Drupal::service('acquia_migrate.previewer');
+      assert($previewer instanceof MigrationPreviewer);
+    }
+
+    Timer::start(Timers::JSONAPI_RESOURCE_OBJECT_MIGRATION_ATTRIBUTES);
     $dependencies_relationship_data = array_map(function (string $migration_id, array $reasons) {
       return [
         'type' => 'migration',
@@ -746,10 +932,13 @@ final class Migration {
     $consists_of_relationship_data = array_map(function (string $migration_plugin_id) use ($data_migration_plugin_ids, $migration) {
       $suffix = '';
       if (in_array($migration_plugin_id, $data_migration_plugin_ids)) {
-        $count = $migration->getMigrationPluginInstances()[$migration_plugin_id]
-          ->getSourcePlugin()
-          ->count();
-        $suffix = " ($count)";
+        $migration_plugin = $migration->getMigrationPluginInstances()[$migration_plugin_id];
+        $source_records_count = $migration_plugin->getSourcePlugin()->count();
+        $plugin_idmap = $migration_plugin->getIdMap();
+        // Imported count also contains fully imported records and records which
+        // need an update (e.g stubs).
+        $fully_imported_count = $plugin_idmap->importedCount() - $plugin_idmap->updateCount();
+        $suffix = " ($fully_imported_count of $source_records_count)";
       }
 
       return [
@@ -794,26 +983,6 @@ final class Migration {
     ];
 
     if ($migration->isImported()) {
-      // @todo Somehow we can get a Migration object with a stale "last import
-      // duration" value, even though it is never cached: not in Page Cache,
-      // Dynamic Page Cache, HttpApi, MigrationConverter or MigrationRepository.
-      // For now, this work-around solves the mystery…
-      // @codingStandardsIgnoreStart
-      $before = $migration->getLastImportDuration();
-      $fresh_flags = (array) \Drupal::database()->select('acquia_migrate_migration_flags', 'm')
-        ->fields('m', [
-          'migration_id',
-          'last_import_duration',
-        ])
-        ->condition('migration_id', $resource_object['id'])
-        ->execute()
-        ->fetchAllAssoc('migration_id')[$resource_object['id']];
-      $migration->lastImportDuration = $after = $fresh_flags['last_import_duration'];
-      if ($before != $after) {
-        \Drupal::logger('acquia_migrate')->debug('last_import_duration race condition work-around saved the day again: instead of ' . (string) $before . ' it now is ' . (string) $after . ' for the %s migration.', [$migration->id()]);
-      }
-      // @codingStandardsIgnoreEnd
-
       $end_time = NULL;
       if ($migration->getLastImportDuration() !== NULL) {
         $end_time = (new \DateTime())->setTimestamp($migration->getLastImportTimestamp() + $migration->getLastImportDuration())->setTimezone(new \DateTimeZone('UTC'))->format(\DateTime::RFC3339);
@@ -846,11 +1015,15 @@ final class Migration {
         ]),
       ];
     }
+    Timer::stop(Timers::JSONAPI_RESOURCE_OBJECT_MIGRATION_ATTRIBUTES);
 
     // Get links to act on this migration based on the it current state. E.g. a
     // migration that doesn't have any imported data will not have a 'rollback'
     // link.
+    Timer::start(Timers::JSONAPI_RESOURCE_OBJECT_MIGRATION_LINKS);
     $available_urls = $migration->getAvailableLinkUrls();
+    Timer::stop(Timers::JSONAPI_RESOURCE_OBJECT_MIGRATION_LINKS);
+
     foreach ($available_urls as $key => $url) {
       assert($url instanceof Url);
       $link_params = [];
@@ -873,6 +1046,20 @@ final class Migration {
         case 'refresh':
           $link_rel = UriDefinitions::LINK_REL_START_BATCH_PROCESS;
           $link_title = t('Refresh');
+          break;
+
+        case 'stop':
+          $link_rel = UriDefinitions::LINK_REL_UPDATE_RESOURCE;
+          $link_title = t('Stop operation');
+          $link_params = [
+            'data' => [
+              'type' => 'migration',
+              'id' => $migration->id(),
+              'attributes' => [
+                'activity' => 'idle',
+              ],
+            ],
+          ];
           break;
 
         case 'complete':
@@ -960,19 +1147,14 @@ final class Migration {
         case 'preview-unmet-requirement:0':
         case 'preview-unmet-requirement:1':
           $link_rel = UriDefinitions::LINK_REL_UNMET_REQUIREMENT;
-          if ($url->getUri() === 'https://github.com/acquia/acquia_migrate#application-concept-no-unprocessed-dependencies') {
-            $repository = \Drupal::service('acquia_migrate.migration_repository');
-            assert($repository instanceof MigrationRepository);
-            static $all_dependency_labels;
-            if (!isset($all_dependency_labels)) {
-              $all_dependency_labels = array_map(function (Migration $migration) {
-                return $migration->label();
-              }, $repository->getMigrations());
-            }
-            $dependency_labels = array_map(function (string $migration_id) use ($all_dependency_labels) {
-              return $all_dependency_labels[$migration_id];
-            }, $migration->getDependencies());
-            $link_title = t('Not all rows in dependent migrations "@dependencies" have been processed yet.', ['@dependencies' => FilteredMarkup::create(implode('", "', $dependency_labels))]);
+          if ($url->getUri() === 'https://github.com/acquia/acquia_migrate#application-concept-no-unprocessed-supporting-configuration') {
+            $exception = $previewer->isReadyForPreview($migration);
+            // This is guaranteed to return an exception.
+            // @see \Drupal\acquia_migrate\Migration::getAvailableLinkUrls()
+            if (!($exception instanceof RowPreviewException)) {
+              throw new \LogicException();
+            };
+            $link_title = $exception->getMessage();
           }
           else {
             throw new \InvalidArgumentException();
@@ -1004,6 +1186,18 @@ final class Migration {
       if (!empty($link_template)) {
         $resource_object['links'][$key] += $link_template;
       }
+    }
+
+    $duration = Timer::stop(Timers::JSONAPI_RESOURCE_OBJECT_MIGRATION)['time'];
+    if ($duration > 500) {
+      \Drupal::service('logger.channel.acquia_migrate_profiling_statistics')
+        ->info(
+          sprintf("stats_type=jsonapi_resource_object_migration|migration_id=%s|duration=%d|links=%s",
+            $migration->id(),
+            round($duration),
+            implode(',', array_keys($resource_object['links']))
+          )
+        );
     }
 
     return $resource_object;

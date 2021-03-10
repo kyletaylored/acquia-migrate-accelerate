@@ -2,10 +2,14 @@
 
 namespace Drupal\acquia_migrate\Controller;
 
+use Acquia\DrupalEnvironmentDetector\AcquiaDrupalEnvironmentDetector;
+use Drupal\acquia_migrate\Form\PublicAcknowledgementForm;
+use Drupal\acquia_migrate\Form\UserOneConfigurationForm;
 use Drupal\acquia_migrate\MigrationRepository;
 use Drupal\acquia_migrate\SourceDatabase;
 use Drupal\Core\Controller\ControllerBase;
 use Drupal\Core\Render\Markup;
+use Drupal\Core\Routing\LocalRedirectResponse;
 use Drupal\Core\Site\Settings;
 use Drupal\Core\Url;
 use Symfony\Component\DependencyInjection\ContainerInterface;
@@ -42,19 +46,85 @@ final class GetStarted extends ControllerBase {
   }
 
   /**
+   * Acquia Migrate: Accelerate's dynamic start page: dynamically redirects.
+   *
+   * @return \Drupal\Core\Routing\LocalRedirectResponse
+   *   A redirect to the appropriate step, or to the list of steps if none could
+   *   be determined.
+   */
+  public function startPage() {
+    $build = $this->build();
+    $steps = $build['content']['#context']['checklist']['#context']['steps'];
+
+    // Redirect to the specific step if any.
+    foreach ($steps as $step_build) {
+      // Find the first non-completed step.
+      if ($step_build['completed']) {
+        continue;
+      }
+      // But if that step is not active, do not redirect to the first available
+      // step.
+      elseif (!$step_build['active']) {
+        break;
+      }
+
+      // Extract the URL for this step.
+      $url = $step_build['content']['label']['#url'];
+      assert($url instanceof Url);
+
+      // Redirect to this URL.
+      $generated_url = $url->toString(TRUE);
+      $generated_url->setCacheMaxAge(0);
+      try {
+        $redirect_response = new LocalRedirectResponse($generated_url->getGeneratedUrl());
+        $redirect_response->addCacheableDependency($generated_url);
+        return $redirect_response;
+      }
+      catch (\InvalidArgumentException $e) {
+        // The redirect was to an external URL. When a step points to an
+        // external URL, do not redirect, and instead let it fall back to the
+        // overview.
+        break;
+      }
+    }
+
+    // Otherwise redirect to the overview listing all steps.
+    return new LocalRedirectResponse(Url::fromRoute('acquia_migrate.get_started')->toString(TRUE)->getGeneratedUrl());
+  }
+
+  /**
    * Return a page render array.
    *
-   * @return array|\Symfony\Component\HttpFoundation\RedirectResponse
-   *   A render array or redirect.
+   * @return array
+   *   A render array.
    */
   public function build() {
-    $current_url = Url::fromRoute('<current>')->toString();
+    $current_url = Url::fromRoute('<current>')->toString(TRUE)->getGeneratedUrl();
     $preselect_url = Url::fromRoute('acquia_migrate.migrations.preselect');
     $dashboard_url = Url::fromRoute('acquia_migrate.migrations.dashboard');
     $steps = [];
+    $steps['user_one'] = [
+      'completed' => UserOneConfigurationForm::hasBeenConfigured(),
+      'active' => !UserOneConfigurationForm::hasBeenConfigured() && $this->currentUser()->isAnonymous(),
+      'content' => [
+        'label' => [
+          '#type' => 'link',
+          '#title' => $this->t('Essential configuration'),
+          '#url' => Url::fromRoute('acquia_migrate.get_started.configure_user_one', [], [
+            'query' => ['destination' => $current_url],
+          ]),
+          '#attributes' => [
+            'class' => 'text-primary',
+          ],
+        ],
+        'description' => [
+          '#markup' => $this->t("You can enter the Drupal 7 source site's base URL and choose the credentials for your site's admin account."),
+        ],
+      ],
+    ];
     $steps['authenticate'] = [
       'completed' => $this->currentUser()->isAuthenticated(),
-      'active' => !$this->currentUser()->isAuthenticated(),
+      'active' => UserOneConfigurationForm::hasBeenConfigured() && !$this->currentUser()->isAuthenticated(),
       'content' => [
         'label' => [
           '#type' => 'link',
@@ -67,10 +137,31 @@ final class GetStarted extends ControllerBase {
           ],
         ],
         'description' => [
-          '#markup' => $this->t('You can log in with the credentials generated for you when this site was installed for the first time.'),
+          '#markup' => $this->t('Log in with the credentials you chose in the first step.'),
         ],
       ],
     ];
+    if (AcquiaDrupalEnvironmentDetector::isAhEnv()) {
+      $steps['public_acknowledge'] = [
+        'completed' => PublicAcknowledgementForm::hasBeenAcknowledged(),
+        'active' => $this->currentUser->isAuthenticated() && !PublicAcknowledgementForm::hasBeenAcknowledged(),
+        'content' => [
+          'label' => [
+            '#type' => 'link',
+            '#title' => $this->t('Security notice.'),
+            '#url' => Url::fromRoute('acquia_migrate.get_started.public_acknowledge', [], [
+              'query' => ['destination' => $current_url],
+            ]),
+            '#attributes' => [
+              'class' => 'text-primary',
+            ],
+          ],
+          'description' => [
+            '#markup' => $this->t('This site is hosted on Acquia Cloud and is publicly accessible if the URL is known. You may want to change that.'),
+          ],
+        ],
+      ];
+    }
     $steps['configure'] = [
       'completed' => SourceDatabase::isConnected(),
       'active' => !SourceDatabase::isConnected(),
@@ -152,7 +243,7 @@ final class GetStarted extends ControllerBase {
     ];
     $steps['import_content'] = [
       'completed' => FALSE,
-      'active' => end($steps)['completed'],
+      'active' => $this->currentUser()->isAuthenticated() && end($steps)['completed'],
       'content' => [
         'label' => [
           '#type' => 'link',
@@ -214,18 +305,24 @@ final class GetStarted extends ControllerBase {
       '#markup' => Markup::create(<<<HTML
 <style>
 #acquia-site-studio .hero {
-    display: flex;
     margin-bottom: 1.5rem;
 }
-/* Match margins for Claro's .page-content. */
-@media screen and (min-width: 38em) {
+@media screen and (min-width: 61rem) {
   #acquia-site-studio .hero {
+    display: flex;
     margin-bottom: 2rem;
   }
 }
 #acquia-site-studio .hero iframe {
-    max-width: 560px;
-    max-height: 315px;
+    min-width: 100%;
+    min-height: 315px;
+}
+@media screen and (min-width: 61rem) {
+    #acquia-site-studio .hero iframe {
+        min-width: unset;
+        max-width: 560px;
+        max-height: 315px;
+    }
 }
 #acquia-site-studio .hero article {
     flex: 1;
@@ -234,27 +331,32 @@ final class GetStarted extends ControllerBase {
 #acquia-site-studio .hero article h2 {
     margin-top: 0;
 }
-#acquia-site-studio .resources {
+#acquia-site-studio .resources,
+#acquia-site-studio .alternatives {
     text-align: center;
 }
 #acquia-site-studio .resources .resource-cards {
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
   grid-auto-rows: minmax(100px, auto);
   padding: 0 2em;
 }
-#acquia-site-studio .resources .resource-cards .resource-card {
-    box-shadow: 0px 3px 10px grey;
+@media screen and (min-width: 61rem) {
+    #acquia-site-studio .resources .resource-cards {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+#acquia-site-studio .resource-card {
+    background: white;
     margin: 1em;
     padding: 1em;
     text-align: left;
     color: inherit;
     text-decoration: none;
 }
-#acquia-site-studio .resources .resource-cards .resource-card:hover {
-    box-shadow: 0px 3px 10px black;
+#acquia-site-studio .resource-card:hover {
+    outline: 1px solid black;
 }
-#acquia-site-studio .resources .resource-cards .resource-card img {
+#acquia-site-studio .resource-card img {
     box-shadow: 0px 3px 5px grey;
     transform: scale(0.95);
     transition: all .2s ease-in-out;
@@ -262,17 +364,17 @@ final class GetStarted extends ControllerBase {
     margin-left: auto;
     margin-right: auto;
 }
-#acquia-site-studio .resources .resource-cards .resource-card img.transparent {
+#acquia-site-studio .resource-card img.transparent {
     box-shadow: none;
 }
-#acquia-site-studio .resources .resource-cards .resource-card:hover img {
+#acquia-site-studio .resource-card:hover img {
   transform: scale(1.05);
 }
-@media screen and (min-width: 85.375rem) {
-    #acquia-site-studio .resources .resource-cards .resource-card {
+@media screen and (min-width: 38em) {
+    #acquia-site-studio .resource-card {
         display: flex;
     }
-    #acquia-site-studio .resources .resource-cards .resource-card img {
+    #acquia-site-studio .resource-card img {
         align-self: center;
         flex-grow: unset;
         max-width: 30%;
@@ -281,21 +383,21 @@ final class GetStarted extends ControllerBase {
     }
 }
 
-#acquia-site-studio .resources .resource-cards .resource-card article h3 {
+#acquia-site-studio .resource-card article h3 {
     font-size: 1.2rem;
 }
-#acquia-site-studio .resources .resource-cards .resource-card article p {
+#acquia-site-studio .resource-card article p {
     color: gray
 }
-#acquia-site-studio .resources .resource-cards .resource-card article .read-more {
+#acquia-site-studio .resource-card article .read-more {
     color: #767676;
     font-weight: bold;
     float: right;
 }
-#acquia-site-studio .resources .resource-cards .resource-card:hover article .read-more {
+#acquia-site-studio .resource-card:hover article .read-more {
     text-decoration: underline;
 }
-#acquia-site-studio .resources .resource-cards .resource-card article .read-more::after {
+#acquia-site-studio .resource-card article .read-more::after {
     content: ' ›'
 }
 </style>
@@ -379,6 +481,24 @@ At the heart of component design is the philosophy: Create once, use many.</p>
           </a>
         </div>
         <!-- <a href="#" class="button button--primary">View all</a> -->
+    </div>
+    <div class="alternatives">
+      <h2>Alternatives to Acquia Site Studio</h2>
+      <a class="resource-card" href="https://www.drupal.org/docs/theming-drupal">
+        <article>
+          <h3>DIY: Port the theme yourself</h3>
+          <p>drupal.org has lots of resources covering theming in Drupal 9! It covers everything from the new <code>*.info.yml</code> files to the vastly improved asset library system, granular overrides, all things Twig, subthemes based on the <q>Stable</q> or <q>Classy</q> base themes in core, breakpoints, and much more.</p>
+          <span class="read-more">Read more</span>
+        </article>
+      </a>
+      <a class="resource-card" href="https://docs.acquia.com/guide/ps/#ps-guide-drupal8-layout-theming">
+        <article>
+          <h3>Need help? Call our Professional Services to guide you through next steps</h3>
+          <p>If you're stuck with Acquia Site Studio or with porting the theme yourself, or are just looking for guidance in finishing either, contact your account manager to arrange for Acquia's Professional Service to determine the optimal approach for your situation.</p>
+          <p>Or better yet, get comprehensive training on Drupal 8 &amp; 9 layout and theming!</p>
+          <span class="read-more">Read more</span>
+        </article>
+      </a>
     </div>
 </div>
 HTML)

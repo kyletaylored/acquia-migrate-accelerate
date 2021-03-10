@@ -2,15 +2,18 @@
 
 namespace Drupal\acquia_migrate\Plugin;
 
+use Drupal\acquia_migrate\Plugin\Discovery\ProfiledContainerDerivativeDiscoveryDecorator;
 use Drupal\Component\Graph\Graph;
 use Drupal\Core\Cache\CacheBackendInterface;
 use Drupal\Core\Config\ConfigFactoryInterface;
 use Drupal\Core\Extension\ModuleHandlerInterface;
 use Drupal\Core\Language\LanguageManagerInterface;
-use Drupal\migrate\Plugin\migrate\destination\Entity;
+use Drupal\Core\Plugin\Discovery\YamlDirectoryDiscovery;
+use Drupal\migrate\Plugin\Discovery\ProviderFilterDecorator;
 use Drupal\migrate\Plugin\MigrateSourcePluginManager;
 use Drupal\migrate\Plugin\Migration as MigrationPlugin;
 use Drupal\migrate\Plugin\MigrationPluginManagerInterface;
+use Drupal\migrate\Plugin\NoSourcePluginDecorator;
 use Drupal\migrate_drupal\MigrationPluginManager as BaseMigrationPluginManager;
 
 /**
@@ -57,6 +60,33 @@ class MigrationPluginManager extends BaseMigrationPluginManager {
   }
 
   /**
+   * {@inheritdoc}
+   *
+   * This is 99% a copy/paste from the parent implementation. The only change is
+   * that we use ProfiledContainerDerivativeDiscoveryDecorator instead of
+   * ContainerDerivativeDiscoveryDecorator.
+   */
+  protected function getDiscovery() {
+    if (!isset($this->discovery)) {
+      $directories = array_map(function ($directory) {
+        return [$directory . '/migrations'];
+      }, $this->moduleHandler->getModuleDirectories());
+
+      $yaml_discovery = new YamlDirectoryDiscovery($directories, 'migrate');
+      // This gets rid of migrations which try to use a non-existent source
+      // plugin. The common case for this is if the source plugin has, or
+      // specifies, a non-existent provider.
+      $only_with_source_discovery = new NoSourcePluginDecorator($yaml_discovery);
+      // This gets rid of migrations with explicit providers set if one of the
+      // providers do not exist before we try to use a potentially non-existing
+      // deriver. This is a rare case.
+      $filtered_discovery = new ProviderFilterDecorator($only_with_source_discovery, [$this->moduleHandler, 'moduleExists']);
+      $this->discovery = new ProfiledContainerDerivativeDiscoveryDecorator($filtered_discovery);
+    }
+    return $this->discovery;
+  }
+
+  /**
    * Omits entity(_revision):* migrations when entity_complete:* exists.
    *
    * @param array $definitions
@@ -98,14 +128,11 @@ class MigrationPluginManager extends BaseMigrationPluginManager {
    * @param array $dynamic_ids
    *   Keys are dynamic ids (for example node:*) values are a list of loaded
    *   migration ids (for example node:page, node:article).
-   * @param bool $only_migration_with_requirements_met
-   *   Set to TRUE when the passed $migrations argument contains only migrations
-   *   that have their source and destination requirements met.
    *
    * @return array
    *   An array of migrations.
    */
-  public function buildDependencyMigration(array $migrations, array $dynamic_ids, $only_migration_with_requirements_met = FALSE) {
+  public function buildDependencyMigration(array $migrations, array $dynamic_ids) {
     // Migration dependencies can be optional or required. If an optional
     // dependency does not run, the current migration is still OK to go. Both
     // optional and required dependencies (if run at all) must run before the
@@ -113,6 +140,9 @@ class MigrationPluginManager extends BaseMigrationPluginManager {
     $dependency_graph = [];
     $required_dependency_graph = [];
     $have_optional = FALSE;
+    if (!empty($dynamic_ids)) {
+      throw new \LogicException('AMA does not support this.');
+    }
     foreach ($migrations as $migration) {
       /** @var \Drupal\migrate\Plugin\MigrationInterface $migration */
       $id = $migration->id();
@@ -151,7 +181,7 @@ class MigrationPluginManager extends BaseMigrationPluginManager {
 
       // Enrich with complete dependency metadata. Key-value pairs where both
       // key and value are always the same (a migration plugin ID).
-      // @see \Drupal\acquia_migrate\Controller\Overview::getAvailableMigrationsSortedByCluster
+      // @see \Drupal\acquia_migrate\Clusterer\MigrationClusterer
       $migration->setMetadata('after', $dependency_graph[$migration_id]['paths']);
       if (!empty($dependency_graph[$migration_id]['reverse_paths'])) {
         $migration_ids = array_keys($dependency_graph[$migration_id]['reverse_paths']);
@@ -162,40 +192,6 @@ class MigrationPluginManager extends BaseMigrationPluginManager {
       }
       assert(array_keys($migration->getMetadata('after')) == array_values($migration->getMetadata('after')));
       assert(array_keys($migration->getMetadata('before')) == array_values($migration->getMetadata('before')));
-
-      // Category.
-      $category = NULL;
-      // @todo The 'Configuration' tag may not be perfectly reliable, we should consider inspecting the entity destination plugin's entity type ID: check whether it is ConfigEntityType.
-      if (in_array('Configuration', $migration->getMigrationTags())) {
-        // Migrations for configuration entities can have migration dependencies
-        // whereas migrations of simple configuration cannot.
-        $category = ($migration->getDestinationPlugin() instanceof Entity || in_array($migration->getDestinationPlugin()->getPluginId(), ['component_entity_display', 'component_entity_form_display'], TRUE))
-          ? 'Configuration entity'
-          : 'Simple configuration';
-      }
-      elseif (in_array('Content', $migration->getMigrationTags())) {
-        $category = 'Content';
-      }
-      else {
-        $category = 'Other';
-      }
-      $migration->setMetadata('category', $category);
-
-      // Prioritize migrations on which nothing else depends.
-      if ($weight === 0 && empty($dependency_graph[$migration_id]['reverse_paths'])) {
-        $weight = 1000;
-        // And especially those that are just simple configuration.
-        if ($migration->getMetadata('category') === 'Simple configuration') {
-          $weight = 2000;
-        }
-      }
-
-      if ($only_migration_with_requirements_met) {
-        if ($migration->allRowsProcessed() === TRUE && $migration->getSourcePlugin()->count() === 0) {
-          $weight += 9999;
-          $migration->setMetadata('category', 'No data');
-        }
-      }
 
       $weights[] = $weight;
     }
