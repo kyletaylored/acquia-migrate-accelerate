@@ -91,6 +91,7 @@ class ServerTimingHeaderForResponseSubscriber implements EventSubscriberInterfac
 
       // Queries.
       $this->generateHeaderIfTimed(Timers::QUERY_LOCK_GC, $response->headers);
+      $this->generateHeaderIfTimed(Timers::QUERY_COUNT_ID_MAP, $response->headers);
 
       // JSON:API resource objects.
       $this->generateHeaderIfTimed(Timers::JSONAPI_RESOURCE_OBJECT_MIGRATION, $response->headers);
@@ -111,7 +112,11 @@ class ServerTimingHeaderForResponseSubscriber implements EventSubscriberInterfac
       Timers::RESPONSE_MESSAGES_COLLECTION => 1000,
     ];
     foreach ($response_syslog_thresholds as $timer_name => $threshold) {
-      $duration = static::getTimerMeasurements($timer_name)['time'];
+      $measurements = static::getTimerMeasurements($timer_name);
+      if ($measurements === NULL) {
+        continue;
+      }
+      $duration = $measurements['time'];
       if ($duration > $threshold) {
         $all_server_timing_headers = $response->headers->allPreserveCase()['Server-Timing'];
         \Drupal::service('logger.channel.acquia_migrate_profiling_statistics')

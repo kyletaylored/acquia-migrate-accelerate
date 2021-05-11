@@ -5,11 +5,14 @@ declare(strict_types=1);
 namespace Drupal\acquia_migrate\Commands;
 
 use Consolidation\OutputFormatters\StructuredData\RowsOfFields;
+use Drupal\acquia_migrate\Controller\HttpApi;
 use Drupal\acquia_migrate\Migration;
 use Drupal\acquia_migrate\MigrationRepository;
 use Drupal\acquia_migrate\Recommendations;
+use Drupal\Component\Assertion\Inspector;
 use Drupal\Core\Extension\ModuleExtensionList;
 use Drupal\Core\KeyValueStore\KeyValueFactoryInterface;
+use Drupal\migrate\Plugin\migrate\destination\NullDestination;
 use Drupal\migrate\Plugin\migrate\id_map\NullIdMap;
 use Drupal\migrate\Plugin\MigrateIdMapInterface;
 use Drupal\migrate\Plugin\MigratePluginManagerInterface;
@@ -45,7 +48,7 @@ final class AcquiaMigrateCommands extends DrushCommands {
   protected $moduleExtensionList;
 
   /**
-   * The Acquia Migrate: Accelerate recommendations.
+   * The Acquia Migrate Accelerate recommendations.
    *
    * @var \Drupal\acquia_migrate\Recommendations
    */
@@ -68,7 +71,7 @@ final class AcquiaMigrateCommands extends DrushCommands {
    * @param \Drupal\Core\Extension\ModuleExtensionList $module_extension_list
    *   The module extension list.
    * @param \Drupal\acquia_migrate\Recommendations $recommendations
-   *   The Acquia Migrate: Accelerate recommendations.
+   *   The Acquia Migrate Accelerate recommendations.
    * @param \Drupal\migrate\Plugin\MigratePluginManagerInterface $source_plugin_manager
    *   The migration source plugin manager.
    */
@@ -147,6 +150,11 @@ final class AcquiaMigrateCommands extends DrushCommands {
 
       // This assumes the recommended version of the vetted module is used.
       $is_vetted = in_array($module->getName(), $vetted);
+      if (!$is_vetted) {
+        // Perhaps this is a dependency of a vetted dependent. For that
+        // dependent to have been vetted, this must have been vetted too.
+        $is_vetted = !empty(array_intersect(array_keys($module->required_by), $vetted));
+      }
       $has_migrations = $this->recommendations::moduleHasMigrations($module);
       $alters_migrations = $this->recommendations::moduleAltersMigrations($module);
       $is_stable = $this->recommendations::moduleIsStable($module);
@@ -172,6 +180,186 @@ final class AcquiaMigrateCommands extends DrushCommands {
       $table[] = $row;
     }
     return new RowsOfFields($table);
+  }
+
+  /**
+   * Status of Acquia Migrate Accelerate. ASCII view of the dashboard + details.
+   *
+   * @param string|null $migration_label_or_id
+   *   (optional) A migration label or ID.
+   * @param array $options
+   *   The options to pass.
+   *
+   * @command ama:status
+   * @filter-output
+   *
+   * @option include-needs-review Includes migrations on "needs review" UI tab.
+   * @option include-completed Includes migrations on "completed" UI tab.
+   * @option include-skipped Includes migrations on "skipped" UI tab.
+   * @option all Includes ALL migrations, regardless of UI tab.
+   *
+   * @usage ama:status
+   *   Shows the same dashboard customers see, but with more detail.
+   * @usage ama:status "User accounts"
+   *   Shows only the "User accounts" migration, but with more detail.
+   * @usage ama:status "User accounts" --verbose
+   *   Same, but now with details about the underlying migration plugins.
+   *
+   * @validate-module-enabled acquia_migrate
+   *
+   * @aliases amas
+   *
+   * @field-labels
+   *   migration: Migration
+   *   tab: UI tab
+   *   processed_count: Proc #
+   *   imported_count: Imp #
+   *   total_count: Tot #
+   *   processed_pct: Proc %
+   *   imported_pct: Imp %
+   *   message_count: Messages
+   *   validation_message_count: M (validation)
+   *   other_message_count: M (other)
+   *   activity: Activity
+   * @default-fields migration,tab,processed_count,imported_count,total_count,processed_pct,imported_pct,message_count,validation_message_count,other_message_count,activity
+   *
+   * @return \Consolidation\OutputFormatters\StructuredData\RowsOfFields
+   *   Migrations' remaining rows formatted as table.
+   *
+   * @throws \Drupal\Component\Plugin\Exception\InvalidPluginDefinitionException
+   * @throws \Drupal\Component\Plugin\Exception\PluginNotFoundException
+   */
+  public function status(string $migration_label_or_id = NULL, array $options = [
+    'include-needs-review' => FALSE,
+    'include-completed' => FALSE,
+    'include-skipped' => FALSE,
+    'all' => FALSE,
+  ]) {
+    // The --all option automatically sets the --include-* options.
+    if ($options['all']) {
+      $options['include-needs-review'] = TRUE;
+      $options['include-completed'] = TRUE;
+      $options['include-skipped'] = TRUE;
+    }
+
+    $table = [];
+
+    if ($migration_label_or_id !== NULL) {
+      $migration_id = Migration::isValidMigrationId($migration_label_or_id)
+        ? $migration_label_or_id
+        : Migration::generateIdFromLabel($migration_label_or_id);
+
+      $migration = $this->migrationRepository->getMigration($migration_id);
+      assert($migration instanceof Migration);
+      $migrations = [$migration_id => $migration];
+    }
+    else {
+      $migrations = $this->migrationRepository->getMigrations();
+      assert(Inspector::assertAllObjects($migrations, Migration::class));
+    }
+
+    foreach ($migrations as $migration) {
+      if (!$options['include-completed'] && $migration->isCompleted() && $migration_label_or_id === NULL) {
+        continue;
+      }
+      if (!$options['include-skipped'] && $migration->isSkipped() && $migration_label_or_id === NULL) {
+        continue;
+      }
+
+      $tab = 'in-progress';
+      if ($migration->isCompleted()) {
+        $tab = 'completed';
+      }
+      elseif ($migration->isSkipped()) {
+        $tab = 'skipped';
+      }
+      elseif ($migration->getUiProcessedCount() === $migration->getTotalCount() && $migration->getMessageCount()) {
+        $tab = 'needs-review';
+      }
+
+      if (!$options['include-needs-review'] && $tab === 'needs-review' && $migration_label_or_id === NULL) {
+        continue;
+      }
+
+      $processed_count = $migration->getUiProcessedCount();
+      $message_count = $migration->getMessageCount();
+      // @codingStandardsIgnoreStart
+      $table[] = [
+        'migration' => $migration->label(),
+        'tab' => $tab,
+        'processed_count' => sprintf("%6d", $processed_count),
+        'imported_count' => $processed_count > 0 ? sprintf("%6d", $migration->getUiImportedCount()) : NULL,
+        'total_count' => sprintf("%6d", $migration->getTotalCount()),
+        'processed_pct' => sprintf("%3d%%", static::getPercentage($migration->getUiProcessedCount(), $migration->getTotalCount())),
+        'imported_pct' => $processed_count > 0
+          ? sprintf("%3d%%", static::getPercentage($migration->getUiImportedCount(), $migration->getTotalCount()))
+          : NULL,
+        'message_count' => sprintf("%6d", $message_count),
+        'validation_message_count' => $message_count > 0
+          ? sprintf("%6d", $migration->getMessageCount(HttpApi::MESSAGE_CATEGORY_ENTITY_VALIDATION))
+          : NULL,
+        'other_message_count' => $migration->getMessageCount() > 0
+          ? sprintf("%6d", $migration->getMessageCount(HttpApi::MESSAGE_CATEGORY_OTHER))
+          : NULL,
+        'activity' => $migration->getActivity(),
+        'completed' => $migration->isCompleted(),
+      ];
+      // @codingStandardsIgnoreEnd
+
+      if (!$options['verbose']) {
+        continue;
+      }
+
+      foreach ($migration->getMigrationPluginInstances() as $id => $migration_plugin) {
+        if (!in_array($id, $migration->getDataMigrationPluginIds())) {
+          continue;
+        }
+        $processed_count = $migration_plugin->getIdMap()->processedCountWithoutNeedsUpdateItems();
+        $imported_count = $migration_plugin->getIdMap()->importedCountWithoutNeedsUpdateItems();
+        $total_count = $migration_plugin->getSourcePlugin()->count();
+        // @codingStandardsIgnoreStart
+        $table[] = [
+          'migration' => "    $id",
+          'processed_count' => sprintf("%6d", $processed_count),
+          'imported_count' => $processed_count > 0
+            ? sprintf("%6d", $imported_count)
+            : NULL,
+          'total_count' => sprintf("%6d", $total_count),
+          'processed_pct' => sprintf("%3d%%", static::getPercentage($processed_count, $total_count)),
+          'imported_pct' => $processed_count > 0
+            ? sprintf("%3d%%", static::getPercentage($imported_count, $total_count))
+            : NULL,
+          'activity' => $migration->getActivity() === Migration::ACTIVITY_IDLE
+            ? NULL
+            : strtolower($migration_plugin->getStatusLabel()),
+        ];
+        // @codingStandardsIgnoreEnd
+      }
+    }
+
+    return new RowsOfFields($table);
+  }
+
+  /**
+   * Gets a percentage without decimals, that rounds down instead of up.
+   *
+   * For example, 99/100 yields 99, but 199/200 and 16497/16499 still yield 99.
+   *
+   * Also handles the case of a zero denominator: returns 100.
+   *
+   * @param int $numerator
+   *   The numerator.
+   * @param int $denominator
+   *   The denominator.
+   *
+   * @return int
+   *   An integer between 0 and 100.
+   */
+  private static function getPercentage(int $numerator, int $denominator) : int {
+    if ($denominator === 0) {
+      return 100;
+    }
+    return (int) floor($numerator / $denominator * 100);
   }
 
   /**
@@ -361,14 +549,14 @@ final class AcquiaMigrateCommands extends DrushCommands {
             ->success(dt('Scan complete, found !unprocessed-count-found of !unprocessed-count-expected unprocessed rows.', [
               '!unprocessed-count-found' => count($unprocessed_remaining_rows),
               '!unprocessed-count-expected' => $unprocessed_count,
-            ]));
+            ]) . "\n\n");
         }
         else {
           $this->logger()
             ->error(dt('Scan complete, found !unprocessed-count-found of !unprocessed-count-expected unprocessed rows.', [
               '!unprocessed-count-found' => count($unprocessed_remaining_rows),
               '!unprocessed-count-expected' => $unprocessed_count,
-            ]));
+            ]) . "\n\n");
         }
         $this->say(dt('ℹ️  %migration-plugin-id @does-or-not use high_water_property. It is currently at @current-high-water-property.', [
           '%migration-plugin-id' => $migration_plugin_id,
@@ -377,6 +565,7 @@ final class AcquiaMigrateCommands extends DrushCommands {
         ]));
       }
     }
+    $this->writeln("\n\n");
     return new RowsOfFields($table);
   }
 
@@ -502,6 +691,10 @@ final class NullMigration extends MigrationPlugin {
     // This is needed to avoid crashing SourcePluginBase.
     // @see \Drupal\migrate\Plugin\migrate\source\SourcePluginBase::__construct()
     $this->idMapPlugin = new NullIdMap([], 'null', []);
+    // This is needed to avoid crashing certain hook_migrate_prepare_row()
+    // implementations.
+    // @see metatag_migrate_prepare_row()
+    $this->destinationPlugin = new NullDestination([], 'null', [], $this);
   }
 
 }

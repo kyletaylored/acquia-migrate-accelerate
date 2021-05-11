@@ -3,6 +3,7 @@
 namespace Drupal\acquia_migrate;
 
 use Drupal\acquia_migrate\Clusterer\Heuristics\SharedLanguageConfig;
+use Drupal\acquia_migrate\Controller\HttpApi;
 use Drupal\acquia_migrate\Exception\RowPreviewException;
 use Drupal\acquia_migrate\Plugin\migrate\id_map\SqlWithCentralizedMessageStorage;
 use Drupal\Component\Assertion\Inspector;
@@ -11,7 +12,6 @@ use Drupal\Component\Utility\Timer;
 use Drupal\Core\Cache\RefinableCacheableDependencyInterface;
 use Drupal\Core\GeneratedUrl;
 use Drupal\Core\Url;
-use Drupal\migrate\Exception\RequirementsException;
 use Drupal\migrate\Plugin\Migration as MigrationPlugin;
 use Drupal\migrate\Plugin\MigrationInterface;
 
@@ -28,6 +28,19 @@ final class Migration {
    * @var string
    */
   const ID_PATTERN = '/^[a-f0-9]{32}-[^\/]{1,192}$/';
+
+  /**
+   * The minimum import ratio that all dependencies are required to reach.
+   *
+   * Note: we consider intentionally skipped rows also as imported. Put
+   * differently: what matters is that a max ratio has errors.
+   *
+   * @see ::isImportable()
+   * @see ::allDependencyRowsProcessed()
+   *
+   * @var int
+   */
+  const MINIMUM_IMPORT_RATIO = 0.70;
 
   /**
    * Nothing is happening for this migration.
@@ -72,9 +85,9 @@ final class Migration {
   protected $label;
 
   /**
-   * IDs of migrations that must be executed before this migration.
+   * Migration plugins instances that cause dependencies, keyed by migration ID.
    *
-   * @var string[]
+   * @var array
    */
   protected $dependencies;
 
@@ -142,13 +155,29 @@ final class Migration {
   protected $lastImportDuration;
 
   /**
+   * Whether this migration supports rollbacks.
+   *
+   * @var bool
+   */
+  private $supportsRollback;
+
+  /**
+   * Whether all rows have been processed.
+   *
+   * @var bool
+   *
+   * @see ::allRowsProcessed()
+   */
+  private $allRowsProcessed;
+
+  /**
    * Constructs a new Migration.
    *
    * @param string $id
    *   The migration ID.
    * @param string $label
    *   The migration label.
-   * @param string[] $dependencies
+   * @param array $dependencies
    *   The IDs of the migrations this migration depends on. Migration IDs as
    *   keys, with an array of migration plugin instances that cause this
    *   dependency as the value for each key.
@@ -189,6 +218,27 @@ final class Migration {
     $this->lastComputedFingerprint = $last_computed_fingerprint;
     $this->lastImportTimestamp = $last_import_timestamp;
     $this->lastImportDuration = $last_import_duration;
+
+    // Computed properties, that can only change when the migration
+    // change, which automatically causes these objects to be reconstructed.
+    // @see \Drupal\acquia_migrate\MigrationRepository::getMigrations()
+    $this->supportsRollback = $this->computeSupportsRollback();
+  }
+
+  /**
+   * Computes whether this migration supports rollbacks.
+   *
+   * @return bool
+   *   Whether this migration supports rollbacks.
+   */
+  private function computeSupportsRollback() : bool {
+    // @todo: should there be a special case here when *some*, but not *all*, plugins support rollback?
+    $rollback_capable_plugins = array_reduce($this->migrationPlugins, function (array $rollback_capable_plugins, MigrationInterface $migration_plugin) {
+      return $migration_plugin->getDestinationPlugin()->supportsRollback()
+        ? array_merge($rollback_capable_plugins, [$migration_plugin])
+        : $rollback_capable_plugins;
+    }, []);
+    return count($rollback_capable_plugins) > 0 && count($rollback_capable_plugins) === count($this->migrationPlugins);
   }
 
   /**
@@ -209,6 +259,9 @@ final class Migration {
       $this->_dependencies[$key] = array_combine($dependency_migration_plugin_ids, $dependency_migration_plugin_ids);
     }
     unset($vars['dependencies']);
+
+    // @todo In the future, consider caching this and manually invalidating this.
+    unset($vars['allRowsProcessed']);
 
     return array_keys($vars);
   }
@@ -465,11 +518,15 @@ final class Migration {
   /**
    * Gets the message count (*data* migration plugins only).
    *
+   * @param string|null $category
+   *   (optional) One of \Drupal\acquia_migrate\Controller\HttpApi::MESSAGE_*.
+   *
    * @return int
    *   The message count.
    */
-  public function getMessageCount() : int {
+  public function getMessageCount(string $category = NULL) : int {
     // @codingStandardsIgnoreStart
+    assert($category === NULL || in_array($category, [HttpApi::MESSAGE_CATEGORY_OTHER, HttpApi::MESSAGE_CATEGORY_ENTITY_VALIDATION]));
     $connection = \Drupal::database();
     // @codingStandardsIgnoreEnd
 
@@ -477,8 +534,14 @@ final class Migration {
       return 0;
     }
 
-    return $connection->select(SqlWithCentralizedMessageStorage::CENTRALIZED_MESSAGE_TABLE)
-      ->condition(SqlWithCentralizedMessageStorage::COLUMN_MIGRATION_ID, $this->id)
+    $query = $connection->select(SqlWithCentralizedMessageStorage::CENTRALIZED_MESSAGE_TABLE)
+      ->condition(SqlWithCentralizedMessageStorage::COLUMN_MIGRATION_ID, $this->id);
+
+    if ($category !== NULL) {
+      $query->condition(SqlWithCentralizedMessageStorage::COLUMN_CATEGORY, $category);
+    }
+
+    return $query
       ->countQuery()
       ->execute()
       ->fetchField();
@@ -706,16 +769,7 @@ final class Migration {
    *   plugins can be rolled back, FALSE otherwise.
    */
   protected function canBeRolledBack() : bool {
-    if ($this->getProcessedCount() === 0) {
-      return FALSE;
-    }
-    // @todo: should there be a special case here when *some*, but not *all*, plugins support rollback?
-    $rollback_capable_plugins = array_reduce($this->migrationPlugins, function (array $rollback_capable_plugins, MigrationInterface $migration_plugin) {
-      return $migration_plugin->getDestinationPlugin()->supportsRollback()
-        ? array_merge($rollback_capable_plugins, [$migration_plugin])
-        : $rollback_capable_plugins;
-    }, []);
-    return count($rollback_capable_plugins) > 0 && count($rollback_capable_plugins) === count($this->migrationPlugins);
+    return $this->supportsRollback && $this->getProcessedCount() > 0;
   }
 
   /**
@@ -725,15 +779,18 @@ final class Migration {
    *   Whether all migration plugins in this migration have been processed.
    */
   public function allRowsProcessed() {
-    $all_rows_processed = TRUE;
-    foreach ($this->migrationPlugins as $migration_plugin) {
-      $all_rows_processed = $all_rows_processed && $migration_plugin->allRowsProcessed();
-      if (!$all_rows_processed) {
-        break;
+    if (!isset($this->allRowsProcessed)) {
+      $all_rows_processed = TRUE;
+      foreach ($this->migrationPlugins as $migration_plugin) {
+        $all_rows_processed = $all_rows_processed && $migration_plugin->allRowsProcessed();
+        if (!$all_rows_processed) {
+          break;
+        }
       }
+      $this->allRowsProcessed = $all_rows_processed;
     }
 
-    return $all_rows_processed;
+    return $this->allRowsProcessed;
   }
 
   /**
@@ -751,7 +808,22 @@ final class Migration {
     $all_dependency_rows_processed = TRUE;
     foreach ($this->dependencies as $migration_plugin_dependencies) {
       foreach ($migration_plugin_dependencies as $migration_plugin) {
-        $all_dependency_rows_processed = $all_dependency_rows_processed && $migration_plugin->allRowsProcessed();
+        /** @var \Drupal\migrate\Plugin\Migration $migration_plugin */
+        // This is a partial reimplementation of
+        // \Drupal\migrate\Plugin\Migration::allRowsProcessed() to avoid
+        // retrieving the source count twice. We have an extra requirement that
+        // not only all rows have been processed, but that a minimum ratio has
+        // been imported (or explicitly skipped).
+        $id_map = $migration_plugin->getIdMap();
+        $source_count = $migration_plugin->getSourcePlugin()->count();
+        $processed_count = $id_map->processedCount();
+        // TRICKY: "imported or skipped" = "total" - "error".
+        // @see \Drupal\migrate\Plugin\MigrateIdMapInterface::STATUS_*
+        $imported_or_skipped_count = $source_count - $id_map->errorCount();
+        $all_dependency_rows_processed = $all_dependency_rows_processed && (
+          $source_count <= 0
+          || ($source_count <= $processed_count && $imported_or_skipped_count / $source_count >= self::MINIMUM_IMPORT_RATIO)
+        );
         if (!$all_dependency_rows_processed) {
           break;
         }
@@ -829,25 +901,18 @@ final class Migration {
    *   all internal migration plugins to be met plus all (external) migration
    *   plugins this migration depends on (in other migrations) must have been
    *   run.
+   *
+   * @see \Drupal\migrate\Plugin\Migration::checkRequirements()
+   * @see \Drupal\acquia_migrate\MigrationClusterer::getAvailableMigrations()
    */
   private function isImportable() {
-    $is_importable = TRUE;
-    foreach ($this->migrationPlugins as $migration_plugin) {
-      try {
-        $migration_plugin->checkRequirements();
-      }
-      catch (RequirementsException $e) {
-        $dependencies_outside_this_cluster = array_diff($e->getRequirements()['requirements'], array_keys($this->migrationPlugins));
-        if (!empty($dependencies_outside_this_cluster)) {
-          $is_importable = FALSE;
-          break;
-        }
-      }
-    }
-
-    $is_importable = $is_importable && $this->allDependencyRowsProcessed();
-
-    return $is_importable;
+    // The simplest possible implementation here would be to call
+    // \Drupal\migrate\Plugin\Migration::checkRequirements(). But that would
+    // repeat source & destination requirements checks that
+    // \Drupal\acquia_migrate\MigrationClusterer::getAvailableMigrations()
+    // already performed, at this point we only need to check if the required
+    // migration dependencies have finished running!
+    return $this->allDependencyRowsProcessed();
   }
 
   /**
@@ -908,6 +973,7 @@ final class Migration {
    */
   public static function toResourceObject(Migration $migration, RefinableCacheableDependencyInterface $cacheability) : array {
     Timer::start(Timers::JSONAPI_RESOURCE_OBJECT_MIGRATION);
+    Timer::start(__CLASS__ . __METHOD__ . $migration->id());
 
     // This may be called repeatedly within a request, but the service will not
     // change. Hence this is safe to statically cache.
@@ -1188,7 +1254,8 @@ final class Migration {
       }
     }
 
-    $duration = Timer::stop(Timers::JSONAPI_RESOURCE_OBJECT_MIGRATION)['time'];
+    Timer::stop(Timers::JSONAPI_RESOURCE_OBJECT_MIGRATION);
+    $duration = Timer::stop(__CLASS__ . __METHOD__ . $migration->id())['time'];
     if ($duration > 500) {
       \Drupal::service('logger.channel.acquia_migrate_profiling_statistics')
         ->info(
